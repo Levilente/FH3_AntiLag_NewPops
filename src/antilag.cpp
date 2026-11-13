@@ -330,6 +330,7 @@ void watch_car(char* car, char* iface) {
 
 // ---- the anti-lag itself ------------------------------------------------------------------------------------------------------------------
 float g_peak        = 0;      // the turbo state while the throttle was down
+float g_peak_boost  = 0;      // the boost pressure while the throttle was down
 double g_lift_ms    = 0;      // when the throttle was lifted (0 = down)
 bool g_lifted       = false;
 int g_al_logged     = 0;
@@ -346,18 +347,29 @@ uint64_t detour_turbo(void* self, float dt) {
         const float rpm = *reinterpret_cast<const float*>(d + kDynEngineOmega) * kRadToRpm;
         const float lim = *reinterpret_cast<const float*>(d + kDynTurboMax);
         if (thr >= 0.5f) {                       // on the throttle: remember how spooled the turbo is
-            g_peak   = *state;
-            g_lifted = false;
+            g_peak       = *state;
+            g_peak_boost = *reinterpret_cast<const float*>(d + kDynBoost);
+            g_lifted     = false;
         } else if (thr < 0.1f && g_peak > 0.0f && lim > 0.0f) {
             if (!g_lifted) { g_lifted = true; g_lift_ms = now_ms(); }
             const double since = now_ms() - g_lift_ms;
             const float cutoff = static_cast<float>(g_al_cutoff.load());
             if (rpm >= cutoff && since < g_al_decay.load()) {
-                const float keep = g_peak * (g_al_retention.load() / 100.0f) * static_cast<float>(1.0 - since / g_al_decay.load());
+                const float k = (g_al_retention.load() / 100.0f) * static_cast<float>(1.0 - since / g_al_decay.load());
+                const float keep = g_peak * k;
+                float* boost         = reinterpret_cast<float*>(d + kDynBoost);
+                const float bmin     = *reinterpret_cast<const float*>(d + 0xEF4);   // boost at rest
+                const float keep_b   = bmin + (g_peak_boost - bmin) * k;
+                // The game pulls both the state (dyn+0x618) and the boost (dyn+0x620) towards rest as soon as the throttle is lifted.
                 if (*state < keep) {
                     *state = keep;
                     *reinterpret_cast<float*>(d + kDynTurboRate) = 0.0f;
-                    if (g_al_logged < 6 && g_verbose) { ++g_al_logged; say("anti-lag: holding the turbo at %.0f (peak %.0f, %.0f rpm, %.0f ms after lift)", static_cast<double>(keep), static_cast<double>(g_peak), static_cast<double>(rpm), since); }
+                }
+                if (*boost < keep_b) *boost = keep_b;
+                if (g_al_logged < 6 && g_verbose) {
+                    ++g_al_logged;
+                    say("anti-lag: holding the turbo at %.0f / boost %.1f (peak %.0f / %.1f, %.0f rpm, %.0f ms after lift)", static_cast<double>(keep),
+                        static_cast<double>(keep_b), static_cast<double>(g_peak), static_cast<double>(g_peak_boost), static_cast<double>(rpm), since);
                 }
             }
         }
