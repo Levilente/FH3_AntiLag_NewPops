@@ -361,8 +361,9 @@ uint64_t detour_turbo(void* self, float dt) {
             const double since = now_ms() - g_lift_ms;
             const float cutoff = static_cast<float>(g_al_cutoff.load());
             if (rpm >= cutoff && since < g_al_decay.load()) {
-                const double x = since / g_al_decay.load();   // 0..1; exponential bleed-off: fast at first, long tail
-                const float k = (g_al_retention.load() / 100.0f) * static_cast<float>((std::exp(-3.0 * x) - std::exp(-3.0)) / (1.0 - std::exp(-3.0)));
+                const double x = since / g_al_decay.load();   // 0..1; stays near the peak, sags slowly, then collapses at the end
+                const double shape = (1.0 - 0.3 * x) * (1.0 - std::pow(x, 8.0));
+                const float k = (g_al_retention.load() / 100.0f) * static_cast<float>(shape);
                 g_al_holding.store(true);
                 const float keep = g_peak * k;
                 float* boost         = reinterpret_cast<float*>(d + kDynBoost);
