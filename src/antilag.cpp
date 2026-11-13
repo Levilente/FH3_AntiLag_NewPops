@@ -32,7 +32,7 @@
 #include <vector>
 
 bool sound_init(const char* type, float volume);
-void sound_play(int strength);
+void sound_play(int strength, bool pos_ok, float lx, float ly, float lz);
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -141,6 +141,7 @@ void set_value(uint32_t garage, int s, int v) {
 std::atomic<char*> g_al_dyn{nullptr};
 std::atomic<bool> g_al_holding{false};   // the turbo hook is holding the boost right now
 constexpr size_t kCarBurble = 0x7478;          // BurbleBackfirePhysics object inside the Car (0xA8 bytes); +0xC = the pop event this frame (0 none, 1..3)
+constexpr uintptr_t kRvaListener = 0x27BFD30;   // FMOD System::set3DListenerAttributes (system, listener, pos, vel, forward, up): the real camera
 constexpr uintptr_t kRvaBurbleStep = 0x18BBB80; // its update (rcx = object, xmm1 = dt, r8 = pointer to the dynamics interface)
 std::atomic<char*> g_al_car{nullptr};
 std::atomic<bool> g_al_lifted_pop{false};      // lifted, above the cutoff and inside the hold time: pops wanted
@@ -463,6 +464,67 @@ double next_gap(double base) {
     const double u = rnd01();
     return base * (0.5 + 1.6 * u * u);
 }
+// ---- the listener (the game's camera, as the game gives it to FMOD) and the exhaust pipes' positions -------------------------------------
+struct Pose { float pos[3], fwd[3], up[3]; };
+Pose g_listener{};
+std::atomic<bool> g_listener_ok{false};
+typedef int (*ListenerFn)(void*, int, const float*, const float*, const float*, const float*);
+ListenerFn g_orig_listener = nullptr;
+int detour_listener(void* sys, int idx, const float* pos, const float* vel, const float* fwd, const float* up) {
+    if (idx == 0 && pos && fwd && up) {
+        __try {
+            Pose p; for (int i = 0; i < 3; ++i) { p.pos[i] = pos[i]; p.fwd[i] = fwd[i]; p.up[i] = up[i]; }
+            g_listener = p; g_listener_ok.store(true);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return g_orig_listener(sys, idx, pos, vel, fwd, up);
+}
+int g_flip_pan = 0;
+// The world position of one of the car's pipes (car + 0x88: eight weak pointers to the exhaust nodes, each node's vtable +0x10 gives its 4x4 matrix).
+bool exhaust_world(char* car, float out[3]) {
+    int idx[8], n = 0;
+    for (int i = 0; i < 8; ++i) {
+        char* el = car + 0x88 + i * 0x10;
+        void* obj = *reinterpret_cast<void**>(el);
+        char* ctrl = *reinterpret_cast<char**>(el + 8);
+        if (obj && ctrl && *reinterpret_cast<int*>(ctrl + 8) > 0) idx[n++] = i;
+    }
+    if (!n) return false;
+    const int pick = idx[static_cast<size_t>(rnd01() * n) % n];
+    char* el = car + 0x88 + pick * 0x10;
+    void* obj = *reinterpret_cast<void**>(el);
+    auto getm = reinterpret_cast<const float* (*)(void*)>((*reinterpret_cast<void***>(obj))[2]);
+    const float* m = getm(obj);
+    if (!m) return false;
+    const char* mode = g_flip_pan >= 100 ? "col" : "row";
+    if (g_flip_pan >= 100) { out[0] = m[3]; out[1] = m[7]; out[2] = m[11]; }
+    else                   { out[0] = m[12]; out[1] = m[13]; out[2] = m[14]; }
+    static int logged = 0;
+    if (logged < 6 && g_listener_ok.load()) {
+        ++logged;
+        say_always("anti-lag: pipe %d (%s) at %.2f %.2f %.2f, camera at %.2f %.2f %.2f, fwd %.2f %.2f %.2f, up %.2f %.2f %.2f; matrix row3 %.2f %.2f %.2f %.2f",
+                   pick, mode, out[0], out[1], out[2], g_listener.pos[0], g_listener.pos[1], g_listener.pos[2],
+                   g_listener.fwd[0], g_listener.fwd[1], g_listener.fwd[2], g_listener.up[0], g_listener.up[1], g_listener.up[2], m[12], m[13], m[14], m[15]);
+    }
+    return true;
+}
+void play_pop(char* car, int strength) {
+    float p[3];
+    if (g_listener_ok.load() && exhaust_world(car, p)) {
+        const Pose L = g_listener;
+        const float d[3] = { p[0] - L.pos[0], p[1] - L.pos[1], p[2] - L.pos[2] };
+        // FMOD's default frame is left handed: right = up x forward
+        float r[3] = { L.up[1] * L.fwd[2] - L.up[2] * L.fwd[1], L.up[2] * L.fwd[0] - L.up[0] * L.fwd[2], L.up[0] * L.fwd[1] - L.up[1] * L.fwd[0] };
+        if (g_flip_pan % 100) for (float& x : r) x = -x;
+        const float lx = d[0] * r[0] + d[1] * r[1] + d[2] * r[2];
+        const float ly = d[0] * L.up[0] + d[1] * L.up[1] + d[2] * L.up[2];
+        const float lz = d[0] * L.fwd[0] + d[1] * L.fwd[1] + d[2] * L.fwd[2];
+        const float dist = std::sqrt(lx * lx + ly * ly + lz * lz);
+        if (dist < 80.0f) { sound_play(strength, true, lx, ly, lz); return; }
+    }
+    sound_play(strength, false, 0, 0, 0);
+}
+
 void detour_burble(void* self, float dt, void** iface) {
     g_orig_burble(self, dt, iface);
     char* car = g_al_car.load();
@@ -487,7 +549,7 @@ void detour_burble(void* self, float dt, void** iface) {
             }
         }
         if (*ev != 0) {                                  // a pop this frame (the game's own or ours): our sound, and the game's effect if wanted
-            sound_play(*ev);
+            play_pop(car, *ev);
             if (!g_native_fx) *ev = 0;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -517,6 +579,9 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_turbo));
     FH3Hook* h4 = g_api->hook_function(g_mod, "Burble/backfire update (Anti-Lag)", g_game + kRvaBurbleStep, reinterpret_cast<void*>(&detour_burble),
                                        reinterpret_cast<void**>(&g_orig_burble));
+    FH3Hook* h5 = g_api->hook_function(g_mod, "FMOD listener (Anti-Lag: 3D sound)", g_game + kRvaListener, reinterpret_cast<void*>(&detour_listener),
+                                       reinterpret_cast<void**>(&g_orig_listener));
+    say("hook: listener %s", h5 && g_api->enable_hooks(g_mod, h5) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
@@ -603,6 +668,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     {
         const std::string type = cfg_str(L"AntiLag", L"Sound", L"Auto");
         const int vol = cfg_int(L"AntiLag", L"SoundVolume", 55);
+        g_flip_pan = cfg_int(L"AntiLag", L"FlipPan", 0);
         sound_set_reverb(static_cast<float>(cfg_int(L"AntiLag", L"Reverb", 8)) / 100.0f);
         if (cfg_int(L"AntiLag", L"PopSound", 1) && !sound_init(type.c_str(), static_cast<float>(vol) / 100.0f)) say_always("anti-lag: the pop sound could not start");
     }

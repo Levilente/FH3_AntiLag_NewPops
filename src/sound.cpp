@@ -159,12 +159,24 @@ bool sound_init(const char* type, float volume) {
     return g_thread != nullptr;
 }
 
-// strength 1 = soft, 2 = normal, 3 = big. Each pop comes from one of the car's pipes: left or right of the middle, a bit behind the listener.
-void sound_play(int strength) {
+// strength 1 = soft, 2 = normal, 3 = big. When pos_ok, (lx, ly, lz) is the pipe's position in the listener's own frame (x right, y up, z ahead, metres);
+// otherwise the pop comes from a random pipe a bit behind the listener.
+void sound_play(int strength, bool pos_ok, float lx, float ly, float lz) {
     if (!g_run.load()) return;
     const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);
-    const float gain = base * g_volume.load() * static_cast<float>(0.8 + 0.4 * rnd());
-    const double side = (rnd() < 0.5 ? -1.0 : 1.0) * (0.25 + 0.55 * rnd());   // -1 left .. +1 right
+    double side = (rnd() < 0.5 ? -1.0 : 1.0) * (0.25 + 0.55 * rnd());   // -1 left .. +1 right
+    float dist_g = 1.0f, dist_lp = 1.0f;
+    if (pos_ok) {
+        const float d = std::sqrt(lx * lx + ly * ly + lz * lz);
+        const float dd = d < 0.3f ? 0.3f : d;
+        side = lx / dd;                                              // sine of the angle off the nose
+        dist_g = 1.0f / (1.0f + 0.35f * (dd - 1.0f > 0 ? dd - 1.0f : 0.0f));
+        if (dist_g < 0.06f) dist_g = 0.06f;
+        float lp = 1.0f - 0.035f * dd;                                // air absorbs the highs
+        if (lz < 0) lp -= 0.25f * (-lz / dd);                         // behind the head: duller
+        dist_lp = lp < 0.25f ? 0.25f : lp;
+    }
+    const float gain = base * g_volume.load() * dist_g * static_cast<float>(0.8 + 0.4 * rnd());
     AcquireSRWLockExclusive(&g_lock);
     if (g_pick.empty()) { ReleaseSRWLockExclusive(&g_lock); return; }
     const Sample& s = g_samples[static_cast<size_t>(g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()])];
@@ -177,13 +189,15 @@ void sound_play(int strength) {
     slot->pos = 0;
     slot->step = (strength >= 3 ? 0.92 : 1.0) * (0.88 + 0.24 * rnd());
     const double far_side = side;                                   // >0: the source is on the right, the left ear is the far one
-    const float near_g = 1.0f, far_g = static_cast<float>(1.0 - 0.45 * std::fabs(side));
+    const double as = std::fabs(side) > 1.0 ? 1.0 : std::fabs(side);
+    const float near_g = 1.0f, far_g = static_cast<float>(1.0 - 0.45 * as);
     slot->gl = gain * (far_side > 0 ? far_g : near_g);
     slot->gr = gain * (far_side > 0 ? near_g : far_g);
-    slot->dl = far_side > 0 ? 24.0 * std::fabs(side) : 0.0;           // up to about 0.5 ms later at the far ear
-    slot->dr = far_side > 0 ? 0.0 : 24.0 * std::fabs(side);
-    slot->al = far_side > 0 ? static_cast<float>(1.0 - 0.65 * std::fabs(side)) : 1.0f;
-    slot->ar = far_side > 0 ? 1.0f : static_cast<float>(1.0 - 0.65 * std::fabs(side));
+    slot->dl = far_side > 0 ? 24.0 * as : 0.0;                       // up to about 0.5 ms later at the far ear
+    slot->dr = far_side > 0 ? 0.0 : 24.0 * as;
+    const float fa = static_cast<float>(1.0 - 0.65 * as);
+    slot->al = (far_side > 0 ? fa : 1.0f) * dist_lp;
+    slot->ar = (far_side > 0 ? 1.0f : fa) * dist_lp;
     slot->lpl = slot->lpr = 0.0f;
     ReleaseSRWLockExclusive(&g_lock);
 }
