@@ -159,6 +159,72 @@ bool sound_init(const char* type, float volume) {
     return g_thread != nullptr;
 }
 
+
+// ---- the game's own FMOD: the samples become FMOD sounds and play as 3D channels at the pipe's world position ------------------------------
+// The functions are the public (static linked) FMOD core API of the game's exe; the System handle is the one the game gives to set3DListenerAttributes.
+namespace {
+typedef int (*CreateSoundFn)(void*, const void*, unsigned, void*, void**);
+typedef int (*PlaySoundFn)(void*, void*, void*, bool, void**);
+typedef int (*Set3DFn)(void*, const float*, const float*, const void*);
+typedef int (*SetFloatFn)(void*, float);
+typedef int (*SetPausedFn)(void*, bool);
+constexpr uintptr_t kCreateSound = 0x27BE3F0, kPlaySound = 0x27BFA40, kSet3D = 0x27C28F0, kSetVolume = 0x27C3450, kSetPitch = 0x27C3160, kSetPaused = 0x27C3080;
+char* g_fgame = nullptr;
+std::atomic<void*> g_fsys{nullptr};
+std::atomic<bool> g_fmod_on{false};
+std::vector<void*> g_fsound;                  // one FMOD sound per sample, made on first use
+std::vector<std::vector<int16_t>> g_fpcm;
+int g_fmod_err = 0;
+}
+void sound_fmod_attach(char* game, bool enable) { g_fgame = game; g_fmod_on.store(enable && game); }
+void sound_fmod_system(void* sys) { if (sys) g_fsys.store(sys); }
+bool sound_fmod_ready() { return g_fmod_on.load() && g_fsys.load() && !g_fmod_err; }
+
+bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int)) {
+    if (!sound_fmod_ready() || g_pick.empty()) return false;
+    __try {
+        void* sys = g_fsys.load();
+        AcquireSRWLockExclusive(&g_lock);
+        const int idx = g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()];
+        ReleaseSRWLockExclusive(&g_lock);
+        if (g_fsound.size() < g_samples.size()) { g_fsound.resize(g_samples.size(), nullptr); g_fpcm.resize(g_samples.size()); }
+        if (!g_fsound[static_cast<size_t>(idx)]) {
+            const Sample& sm = g_samples[static_cast<size_t>(idx)];
+            std::vector<int16_t>& pcm = g_fpcm[static_cast<size_t>(idx)];
+            pcm.assign(sm.data, sm.data + sm.frames);
+            const uint32_t fade = 960;                                  // 20 ms fade out: the cut at the end must not click
+            for (uint32_t i = 0; i < fade && i < sm.frames; ++i) pcm[sm.frames - 1 - i] = static_cast<int16_t>(pcm[sm.frames - 1 - i] * (static_cast<float>(i) / fade));
+            alignas(8) unsigned char ex[0x20] = {};
+            *reinterpret_cast<int*>(ex + 0x00) = 0x18;                  // cbsize: only the fields up to 'format' (the game's FMOD takes shorter structs)
+            *reinterpret_cast<unsigned*>(ex + 0x04) = sm.frames * 2;    // length in bytes
+            *reinterpret_cast<int*>(ex + 0x0C) = 1;                     // numchannels
+            *reinterpret_cast<int*>(ex + 0x10) = 48000;                 // defaultfrequency
+            *reinterpret_cast<int*>(ex + 0x14) = 2;                     // FMOD_SOUND_FORMAT_PCM16
+            void* snd = nullptr;
+            const unsigned mode = 0x1 | 0x10 | 0x100 | 0x800 | 0x1000;  // LOOP_OFF | 3D | CREATESAMPLE | OPENMEMORY | OPENRAW
+            const int r = reinterpret_cast<CreateSoundFn>(g_fgame + kCreateSound)(sys, pcm.data(), mode, ex, &snd);
+            if (log) log("createSound", r);
+            if (r != 0 || !snd) { g_fmod_err = r ? r : -1; return false; }
+            g_fsound[static_cast<size_t>(idx)] = snd;
+        }
+        void* ch = nullptr;
+        int r = reinterpret_cast<PlaySoundFn>(g_fgame + kPlaySound)(sys, g_fsound[static_cast<size_t>(idx)], nullptr, true, &ch);
+        if (log) log("playSound", r);
+        if (r != 0 || !ch) return false;
+        const float vel[3] = {0, 0, 0};
+        r = reinterpret_cast<Set3DFn>(g_fgame + kSet3D)(ch, pos, vel, nullptr);
+        if (log) log("set3DAttributes", r);
+        const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);
+        reinterpret_cast<SetFloatFn>(g_fgame + kSetVolume)(ch, base * g_volume.load() * static_cast<float>(0.8 + 0.4 * rnd()));
+        reinterpret_cast<SetFloatFn>(g_fgame + kSetPitch)(ch, static_cast<float>((strength >= 3 ? 0.92 : 1.0) * (0.88 + 0.24 * rnd())));
+        reinterpret_cast<SetPausedFn>(g_fgame + kSetPaused)(ch, false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_fmod_err = -2;
+        return false;
+    }
+}
+
 // strength 1 = soft, 2 = normal, 3 = big. When pos_ok, (lx, ly, lz) is the pipe's position in the listener's own frame (x right, y up, z ahead, metres);
 // otherwise the pop comes from a random pipe a bit behind the listener.
 void sound_play(int strength, bool pos_ok, float lx, float ly, float lz) {

@@ -33,6 +33,10 @@
 
 bool sound_init(const char* type, float volume);
 void sound_play(int strength, bool pos_ok, float lx, float ly, float lz);
+void sound_fmod_attach(char* game, bool enable);
+void sound_fmod_system(void* sys);
+bool sound_fmod_ready();
+bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int));
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -471,6 +475,7 @@ std::atomic<bool> g_listener_ok{false};
 typedef int (*ListenerFn)(void*, int, const float*, const float*, const float*, const float*);
 ListenerFn g_orig_listener = nullptr;
 int detour_listener(void* sys, int idx, const float* pos, const float* vel, const float* fwd, const float* up) {
+    sound_fmod_system(sys);
     if (idx == 0 && pos && fwd && up) {
         __try {
             Pose p; for (int i = 0; i < 3; ++i) { p.pos[i] = pos[i]; p.fwd[i] = fwd[i]; p.up[i] = up[i]; }
@@ -508,8 +513,13 @@ bool exhaust_world(char* car, float out[3]) {
     }
     return true;
 }
+void fmod_log(const char* what, int r) {
+    static int n = 0;
+    if (n < 12 || r != 0) { ++n; if (n < 40) say_always("anti-lag: FMOD %s -> %d", what, r); }
+}
 void play_pop(char* car, int strength) {
     float p[3];
+    if (sound_fmod_ready() && exhaust_world(car, p) && sound_play_fmod(strength, p, fmod_log)) return;
     if (g_listener_ok.load() && exhaust_world(car, p)) {
         const Pose L = g_listener;
         const float d[3] = { p[0] - L.pos[0], p[1] - L.pos[1], p[2] - L.pos[2] };
@@ -571,6 +581,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
 DWORD WINAPI install_hooks(LPVOID) {
     g_game = static_cast<char*>(g_api->wait_for_code(0xFFFFFFFFu));
     if (!g_game) { say_always("the game's code never became ready: no hooks"); return 0; }
+    sound_fmod_attach(g_game, cfg_int(L"AntiLag", L"FMOD", 1) != 0);
     FH3Hook* h1 = g_api->hook_function(g_mod, "Car update (Anti-Lag)", g_game + kRvaCarUpdate, reinterpret_cast<void*>(&detour_car_update),
                                        reinterpret_cast<void**>(&g_orig_car_update));
     FH3Hook* h2 = g_api->hook_function(g_mod, "HUD controller (Anti-Lag: the player's car)", g_game + kRvaHudCtrl, reinterpret_cast<void*>(&detour_hud),
