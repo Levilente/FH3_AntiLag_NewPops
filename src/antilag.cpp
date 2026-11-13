@@ -1,9 +1,11 @@
 // Anti-Lag for Forza Horizon 3 (FH3 Mod Platform mod).
 //
-// Garage > Upgrades > Engine > "Anti-Lag" (Stock / Anti-Lag). A car with it gets four rows on its Tuning > Springs page
-// (pressure decay, boost retention, cutoff RPM, pop interval), saved per garage car in fh3-mods\AntiLag.ini.
+// A new entry in the game's own turbo upgrade list (Garage > Upgrades > Engine > Turbo / Twin Turbo): after Street, Sport and Race
+// comes "Race Turbo w/ Anti-Lag" (the Race turbo's data with a marker value in TorqueDropOffRPM0, which the mod finds in the car's
+// physics objects to know the car has it). A car with it gets four rows on its Tuning > Springs page (pressure decay, boost
+// retention, cutoff RPM, pop interval), saved per garage car in fh3-mods\AntiLag.ini.
 //
-// Version 0.1.0 is a PROBE build: it registers the upgrade and the rows, and has a recorder (hotkey F8) that dumps the
+// Version 0.2.0 is still a PROBE build: the turbo entry and the rows exist, and a recorder (hotkey F8) dumps the
 // player car's physics objects every other frame to fh3-mods\antilag-probe.bin (+ a map of the objects in
 // fh3-mods\antilag-probe.txt), so the turbo's boost value and the exhaust-pop trigger can be found. The anti-lag
 // itself is not active yet.
@@ -20,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -27,23 +30,20 @@ namespace {
 
 constexpr size_t kOffIface    = 0x71E8;   // Car -> car dynamics interface (CCarDynamics + 0x4B0)
 constexpr size_t kIfaceToDyn  = 0x4B0;
-constexpr size_t kIfOmega     = 0x1D4;    // interface: engine angular velocity (rad/s)
-constexpr size_t kIfGear      = 0xAA8;    // interface: gear (byte, low nibble)
 constexpr size_t kDynSize     = 0xD600;   // CCarDynamics object size dumped by the probe
 constexpr size_t kCarSize     = 0x7800;   // Car object size dumped by the probe
 constexpr uintptr_t kRvaCarUpdate = 0x18B8D20;
 constexpr uintptr_t kRvaHudCtrl   = 0xB26690;
-constexpr float kRadPerSecToRpm   = 9.549296586f;
+constexpr float kMarker = 9001.0f;   // TorqueDropOffRPM0 of the anti-lag turbo rows (the game's own rows have 9000)
 
 const FH3ModApi* g_api = nullptr;
 FH3Mod* g_mod          = nullptr;
-int g_handle           = -1;
 char* g_game           = nullptr;
 std::atomic<bool> g_stop{false};
 HANDLE g_threads[2] = {};
 
 // ---- config (fh3-mods\AntiLag.ini) -----------------------------------------------------------------------------------------------
-int g_price      = 6000;
+int g_extra_price = 2000;   // what the anti-lag turbo costs more than the Race turbo
 bool g_verbose   = false;
 std::wstring g_cfg_path;
 
@@ -106,7 +106,18 @@ void set_value(uint32_t garage, int s, int v) {
     WritePrivateProfileStringW(sec, kDefs[s].ini, val, g_cfg_path.c_str());
 }
 
-bool car_has_kit() { return g_handle >= 0 && g_api->upgrade_stage(g_mod, g_handle, 0) > 0; }
+// Does the car (garage id) have the anti-lag turbo? Learnt while the car is driven (the marker is found in its physics objects);
+// a car not seen yet shows the rows, so the player can always reach them.
+CRITICAL_SECTION g_cs;
+std::map<uint32_t, bool> g_has;
+bool car_has_kit() {
+    const uint32_t garage = g_api->upgrade_active_garage();
+    EnterCriticalSection(&g_cs);
+    auto it = g_has.find(garage);
+    const bool r = it == g_has.end() ? true : it->second;
+    LeaveCriticalSection(&g_cs);
+    return r;
+}
 
 float row_get(void* u) { return static_cast<float>(value_for(g_api->upgrade_active_garage(), static_cast<int>(reinterpret_cast<intptr_t>(u)))); }
 void row_set(void* u, float v) {
@@ -262,6 +273,32 @@ void rec_frame(char* car, char* iface) {
 
 void on_rec_key(void*, const char*) { g_rec_toggle.store(true); }
 
+// Finds the marker float in the car's physics objects (once every half second). Returns the offset found (>= 0) or -1.
+long scan_marker(char* car, char* dyn) {
+    struct Region { char* base; size_t size; long tag; } regs[2] = {{dyn, kDynSize, 0x100000}, {car, kCarSize, 0x200000}};
+    for (const Region& r : regs)
+        for (size_t o = 0; o + 4 <= r.size; o += 4)
+            if (*reinterpret_cast<const float*>(r.base + o) == kMarker) return r.tag + static_cast<long>(o);
+    return -1;
+}
+ULONGLONG g_scan_t = 0;
+void watch_car(char* car, char* iface) {
+    const ULONGLONG t = GetTickCount64();
+    if (t - g_scan_t < 500) return;
+    g_scan_t = t;
+    long at = -1;
+    __try { at = scan_marker(car, iface - kIfaceToDyn); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const uint32_t garage = g_api->upgrade_active_garage();
+    if (!garage) return;
+    EnterCriticalSection(&g_cs);
+    auto it = g_has.find(garage);
+    const bool changed = it == g_has.end() || it->second != (at >= 0);
+    g_has[garage] = at >= 0;
+    LeaveCriticalSection(&g_cs);
+    if (changed) say_always("anti-lag: garage car %u %s (marker %s0x%lX)", garage, at >= 0 ? "HAS the anti-lag turbo" : "has no anti-lag turbo",
+                            at >= 0x200000 ? "car+" : "dyn+", at >= 0 ? (at & 0xFFFFF) : 0);
+}
+
 // ---- hooks ------------------------------------------------------------------------------------------------------------------------------
 std::atomic<void*> g_hud_player{nullptr};
 std::atomic<ULONGLONG> g_hud_tick{0};
@@ -275,7 +312,7 @@ uint64_t detour_car_update(void* self, float dt) {
     if (!car || !hud || g_stop.load()) return r;
     __try {
         char* iface = *reinterpret_cast<char**>(car + kOffIface);
-        if (iface && (static_cast<void*>(car) == hud || static_cast<void*>(iface) == hud) && GetTickCount64() - g_hud_tick.load() < 600) rec_frame(car, iface);
+        if (iface && (static_cast<void*>(car) == hud || static_cast<void*>(iface) == hud) && GetTickCount64() - g_hud_tick.load() < 600) { watch_car(car, iface); rec_frame(car, iface); }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static int logged = 0;
         if (logged++ < 5) say_always("anti-lag: a fault in the Car update step");
@@ -310,23 +347,55 @@ DWORD WINAPI install_hooks(LPVOID) {
     return 0;
 }
 
-// ---- the upgrade -------------------------------------------------------------------------------------------------------------------------
-int add_upgrade() {
-    static const wchar_t* names[2] = {L"Stock", L"Anti-Lag"};
-    static const wchar_t* descs[2] = {L"No anti-lag.",
-                                      L"Keeps the turbo spooled when you lift off the throttle, with exhaust pops. Tune it on the car's Tuning, Springs page, in the Anti-Lag rows."};
-    static FH3UpgradeStage stages[2];
-    for (int i = 0; i < 2; ++i) stages[i] = {names[i], descs[i], i ? g_price : 0, nullptr, nullptr};
-    FH3UpgradeDef d{};
-    d.size           = sizeof d;
-    d.id             = "antilag.system";
-    d.name           = L"Anti-Lag";
-    d.description    = L"Keeps the turbo spooled when you lift off the throttle, with exhaust pops and flames.";
-    d.area           = 1;   // Engine
-    d.stage_count    = 2;
-    d.stages         = stages;
-    d.preferred_slot = -1;
-    return g_api->register_upgrade(g_mod, &d);
+// ---- the turbo entries (pure data: SQL on the game's database copy + new texts) --------------------------------------------------------
+// UpgradeTypes 8 = single turbo (List_UpgradeEngineTurboSingle), 51 = twin turbo (List_UpgradeEngineTurboTwin); Level 1 to 3 are Street, Sport
+// and Race. Level 4 is new: a copy of every engine's Race row, Price + extra, TorqueDropOffRPM0 = 9001 (the marker; the game's rows have 9000).
+constexpr int kLevel          = 4;
+constexpr int kUpgradeIdSingle = 9000020;
+constexpr int kUpgradeIdTwin   = 9000021;
+constexpr uint32_t kKeyNameSingle = 0xD4A60201u;
+constexpr uint32_t kKeyDescSingle = 0xD4A60202u;
+constexpr uint32_t kKeyNameTwin   = 0xD4A60203u;
+constexpr uint32_t kKeyDescTwin   = 0xD4A60204u;
+const char kIconSingle[]  = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Engine_Power\\turbo_single_3.swatchbin";
+const char kImageSingle[] = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Engine_Power\\turbo_single_LG_3.swatchbin";
+const char kIconTwin[]    = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Engine_Power\\turbo_twin_3.swatchbin";
+const char kImageTwin[]   = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Engine_Power\\turbo_twin_LG_3.swatchbin";
+
+std::string text_ref(uint32_t key) { return "_&" + std::to_string((static_cast<unsigned long long>(FH3_TABLE_UPGRADES) << 32) | key); }
+
+std::string rows_sql(const char* table) {
+    char b[1500];
+    std::snprintf(b, sizeof b,
+                  "INSERT OR IGNORE INTO %s (Id,EngineID,Level,IsStock,ManufacturerID,MassDiff,WeightDistDiff,Price,MomentInertia,MaxScale,PowerMaxScale,MinScale,"
+                  "PowerMinScale,RobScale,TorqueDropOffRPM0,TorqueDropOffRPM1,TorqueDropOffScale0,TorqueDropOffScale1) "
+                  "SELECT EngineID*1000+%d,EngineID,%d,0,ManufacturerID,MassDiff,WeightDistDiff,Price+%d,MomentInertia,MaxScale,PowerMaxScale,MinScale,"
+                  "PowerMinScale,RobScale,%.1f,TorqueDropOffRPM1,TorqueDropOffScale0,TorqueDropOffScale1 FROM %s r WHERE r.Level=3 "
+                  "AND NOT EXISTS (SELECT 1 FROM %s x WHERE x.EngineID=r.EngineID AND x.Level=%d);",
+                  table, kLevel, kLevel, g_extra_price, static_cast<double>(kMarker), table, table, kLevel);
+    return b;
+}
+
+void add_turbo_entries() {
+    g_api->add_string_key(g_mod, "Upgrades.str", kKeyNameSingle, L"Race Turbo w/ Anti-Lag");
+    g_api->add_string_key(g_mod, "Upgrades.str", kKeyDescSingle,
+                          L"The Race turbo with anti-lag: it stays spooled when you lift off the throttle, with exhaust pops and flames. "
+                          L"Tune it on the car's Tuning, Springs page.");
+    g_api->add_string_key(g_mod, "Upgrades.str", kKeyNameTwin, L"Race Twin Turbo w/ Anti-Lag");
+    g_api->add_string_key(g_mod, "Upgrades.str", kKeyDescTwin,
+                          L"The Race twin turbo with anti-lag: it stays spooled when you lift off the throttle, with exhaust pops and flames. "
+                          L"Tune it on the car's Tuning, Springs page.");
+    std::string sql;
+    char b[900];
+    std::snprintf(b, sizeof b, "INSERT OR REPLACE INTO Upgrades (id,TypeId,IsException,Name,Level,Description,IconPath,ImagePath) VALUES (%d,'8',0,'%s',%d,'%s','%s','%s');",
+                  kUpgradeIdSingle, text_ref(kKeyNameSingle).c_str(), kLevel, text_ref(kKeyDescSingle).c_str(), kIconSingle, kImageSingle);
+    sql += b;
+    std::snprintf(b, sizeof b, "INSERT OR REPLACE INTO Upgrades (id,TypeId,IsException,Name,Level,Description,IconPath,ImagePath) VALUES (%d,'51',0,'%s',%d,'%s','%s','%s');",
+                  kUpgradeIdTwin, text_ref(kKeyNameTwin).c_str(), kLevel, text_ref(kKeyDescTwin).c_str(), kIconTwin, kImageTwin);
+    sql += b;
+    sql += rows_sql("List_UpgradeEngineTurboSingle");
+    sql += rows_sql("List_UpgradeEngineTurboTwin");
+    g_api->add_sql(g_mod, sql.c_str());
 }
 
 }  // namespace
@@ -334,6 +403,7 @@ int add_upgrade() {
 FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     if (api->api_version < 13) return 1;
     g_api = api;
+    InitializeCriticalSection(&g_cs);
 
     FH3ModInfo info{};
     info.size             = sizeof info;
@@ -348,13 +418,12 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     if (!g_mod) return 1;
 
     g_cfg_path = std::wstring(api->azimuth_dir) + L"\\fh3-mods\\AntiLag.ini";
-    g_price    = cfg_int(L"AntiLag", L"Price", g_price);
+    g_extra_price = cfg_int(L"AntiLag", L"ExtraPrice", g_extra_price);
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
     for (int s = 0; s < kSettingCount; ++s) g_defaults[s] = cfg_int(L"Defaults", kDefs[s].ini, kDefs[s].def);
 
-    g_handle = add_upgrade();
-    say("registered: upgrade handle %d (price %d)", g_handle, g_price);
-    if (g_handle < 0) return 1;
+    if (api->api_version >= 10) add_turbo_entries();
+    else say_always("anti-lag: this platform (API %u) can not add the turbo entries (needs API 10)", api->api_version);
 
     for (int s = 0; s < kSettingCount; ++s) {
         FH3TuningRow row{};
