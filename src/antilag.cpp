@@ -5,10 +5,15 @@
 // physics objects to know the car has it). A car with it gets four rows on its Tuning > Springs page (pressure decay, boost
 // retention, cutoff RPM, pop interval), saved per garage car in fh3-mods\AntiLag.ini.
 //
-// Version 0.2.0 is still a PROBE build: the turbo entry and the rows exist, and a recorder (hotkey F8) dumps the
+// How the boost works in the game (found from a probe recording and the code): the turbo model's step (game+0x1D82090, rcx = CCarDynamics,
+// xmm1 = dt) keeps a shaft/compressor state at dyn+0x618 (0 to the limit at dyn+0xEF0), whose rate is dyn+0x61C, and the boost pressure
+// at dyn+0x620 (dyn+0xEF4 to dyn+0xEF8) follows from it. When the throttle (dyn+0x1BD0) is lifted the state decays at once. Anti-lag
+// hooks the step and, while the throttle is lifted above the cutoff RPM, keeps the state from falling below the retained level.
+//
+// A recorder (hotkey F8, development) dumps the
 // player car's physics objects every other frame to fh3-mods\antilag-probe.bin (+ a map of the objects in
 // fh3-mods\antilag-probe.txt), so the turbo's boost value and the exhaust-pop trigger can be found. The anti-lag
-// itself is not active yet.
+// itself helps to find more of the game's turbo/backfire state.
 //
 // Player car detection and the Car::Update / HUD controller hooks are the same as Launch Control's (read from the
 // game's code; see the platform's docs/car-mods.md and docs/fh3-game-notes.md).
@@ -33,6 +38,14 @@ constexpr size_t kIfaceToDyn  = 0x4B0;
 constexpr size_t kDynSize     = 0xD600;   // CCarDynamics object size dumped by the probe
 constexpr size_t kCarSize     = 0x7800;   // Car object size dumped by the probe
 constexpr uintptr_t kRvaCarUpdate = 0x18B8D20;
+constexpr uintptr_t kRvaTurboStep = 0x1D82090;   // the turbo model's step (rcx = CCarDynamics, xmm1 = dt)
+constexpr size_t kDynTurboState = 0x618;         // compressor/shaft state, 0 .. dyn+0xEF0
+constexpr size_t kDynTurboRate  = 0x61C;
+constexpr size_t kDynBoost      = 0x620;         // boost pressure, dyn+0xEF4 .. dyn+0xEF8
+constexpr size_t kDynTurboMax   = 0xEF0;
+constexpr size_t kDynThrottleIn = 0x1BD0;        // throttle 0..1 the engine torque is blended with
+constexpr size_t kDynEngineOmega = 0x5F8;        // engine speed, rad/s
+constexpr float kRadToRpm = 9.549296586f;
 constexpr uintptr_t kRvaHudCtrl   = 0xB26690;
 constexpr float kMarker = 9001.0f;   // TorqueDropOffRPM0 of the anti-lag turbo rows (the game's own rows have 9000)
 
@@ -108,6 +121,8 @@ void set_value(uint32_t garage, int s, int v) {
 
 // Does the car (garage id) have the anti-lag turbo? Learnt while the car is driven (the marker is found in its physics objects);
 // a car not seen yet shows the rows, so the player can always reach them.
+std::atomic<char*> g_al_dyn{nullptr};   // the player's CCarDynamics, set while its car has the anti-lag turbo
+std::atomic<int> g_al_decay{6000}, g_al_retention{85}, g_al_cutoff{1800};
 CRITICAL_SECTION g_cs;
 std::map<uint32_t, bool> g_has;
 bool car_has_kit() {
@@ -295,7 +310,15 @@ void watch_car(char* car, char* iface) {
     long at = -1;
     __try { at = scan_marker(car, iface - kIfaceToDyn); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     const uint32_t garage = g_api->upgrade_active_garage();
-    if (!garage) return;
+    if (!garage) { g_al_dyn.store(nullptr); return; }
+    if (at >= 0) {
+        g_al_decay.store(value_for(garage, kDecay));
+        g_al_retention.store(value_for(garage, kRetention));
+        g_al_cutoff.store(value_for(garage, kCutoff));
+        g_al_dyn.store(iface - kIfaceToDyn);
+    } else {
+        g_al_dyn.store(nullptr);
+    }
     EnterCriticalSection(&g_cs);
     auto it = g_has.find(garage);
     const bool changed = it == g_has.end() || it->second != (at >= 0);
@@ -303,6 +326,44 @@ void watch_car(char* car, char* iface) {
     LeaveCriticalSection(&g_cs);
     if (changed) say_always("anti-lag: garage car %u %s (marker %s0x%lX)", garage, at >= 0 ? "HAS the anti-lag turbo" : "has no anti-lag turbo",
                             at >= 0x200000 ? "car+" : "dyn+", at >= 0 ? (at & 0xFFFFF) : 0);
+}
+
+// ---- the anti-lag itself ------------------------------------------------------------------------------------------------------------------
+float g_peak        = 0;      // the turbo state while the throttle was down
+double g_lift_ms    = 0;      // when the throttle was lifted (0 = down)
+bool g_lifted       = false;
+int g_al_logged     = 0;
+
+typedef uint64_t (*TurboStepFn)(void*, float);
+TurboStepFn g_orig_turbo = nullptr;
+uint64_t detour_turbo(void* self, float dt) {
+    const uint64_t r = g_orig_turbo(self, dt);
+    if (self != g_al_dyn.load() || g_stop.load()) return r;
+    __try {
+        char* d       = static_cast<char*>(self);
+        float* state  = reinterpret_cast<float*>(d + kDynTurboState);
+        const float thr = *reinterpret_cast<const float*>(d + kDynThrottleIn);
+        const float rpm = *reinterpret_cast<const float*>(d + kDynEngineOmega) * kRadToRpm;
+        const float lim = *reinterpret_cast<const float*>(d + kDynTurboMax);
+        if (thr >= 0.5f) {                       // on the throttle: remember how spooled the turbo is
+            g_peak   = *state;
+            g_lifted = false;
+        } else if (thr < 0.1f && g_peak > 0.0f && lim > 0.0f) {
+            if (!g_lifted) { g_lifted = true; g_lift_ms = now_ms(); }
+            const double since = now_ms() - g_lift_ms;
+            const float cutoff = static_cast<float>(g_al_cutoff.load());
+            if (rpm >= cutoff && since < g_al_decay.load()) {
+                const float keep = g_peak * (g_al_retention.load() / 100.0f) * static_cast<float>(1.0 - since / g_al_decay.load());
+                if (*state < keep) {
+                    *state = keep;
+                    *reinterpret_cast<float*>(d + kDynTurboRate) = 0.0f;
+                    if (g_al_logged < 6 && g_verbose) { ++g_al_logged; say("anti-lag: holding the turbo at %.0f (peak %.0f, %.0f rpm, %.0f ms after lift)", static_cast<double>(keep), static_cast<double>(g_peak), static_cast<double>(rpm), since); }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return r;
 }
 
 // ---- hooks ------------------------------------------------------------------------------------------------------------------------------
@@ -346,6 +407,9 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_car_update));
     FH3Hook* h2 = g_api->hook_function(g_mod, "HUD controller (Anti-Lag: the player's car)", g_game + kRvaHudCtrl, reinterpret_cast<void*>(&detour_hud),
                                        reinterpret_cast<void**>(&g_orig_hud));
+    FH3Hook* h3 = g_api->hook_function(g_mod, "Turbo model step (Anti-Lag)", g_game + kRvaTurboStep, reinterpret_cast<void*>(&detour_turbo),
+                                       reinterpret_cast<void**>(&g_orig_turbo));
+    say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
     say("hooks: Car update %s, HUD controller %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
@@ -465,6 +529,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
 
 FH3MOD_EXPORT void fh3mod_shutdown(void) {
     g_stop.store(true);
+    g_al_dyn.store(nullptr);
     for (HANDLE& h : g_threads)
         if (h) {
             WaitForSingleObject(h, 3000);
