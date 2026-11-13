@@ -1,6 +1,7 @@
 // The pop sounds: FH6's backfire samples (packed into sounds.pak, linked into the DLL) mixed by a small waveOut mixer of our own.
 // Every pop picks a random sample (of the chosen engine type, or all of them), with a random pitch, volume and pan.
 #include <windows.h>
+#include <xmmintrin.h>
 #include <mmsystem.h>
 
 #include <atomic>
@@ -21,7 +22,7 @@ std::vector<int> g_pick;                       // indices of the samples in use
 std::string g_type_cfg = "Auto";                // Auto (by the car), All, or one type
 
 struct Voice { const int16_t* data = nullptr; uint32_t frames = 0; double pos = 0, step = 1; float gl = 0, gr = 0; double dl = 0, dr = 0; float lpl = 0, lpr = 0, al = 1, ar = 1; };
-constexpr int kVoices = 16, kRate = 44100, kBuf = 512, kBufs = 4;
+constexpr int kVoices = 16, kRate = 48000, kBuf = 480, kBufs = 6;   // 10 ms buffers; the samples are 48 kHz too, so Windows has nothing to resample
 Voice g_voices[kVoices];
 SRWLOCK g_lock = SRWLOCK_INIT;
 HWAVEOUT g_wo = nullptr;
@@ -58,7 +59,10 @@ void fill(int16_t* out) {
                 const uint32_t k = static_cast<uint32_t>(p);
                 if (k + 1 >= v.frames) return 0.0f;
                 const float f = static_cast<float>(p - k);
-                return (static_cast<float>(v.data[k]) * (1.0f - f) + static_cast<float>(v.data[k + 1]) * f) / 32768.0f;
+                float e = 1.0f;                                             // short fades: no click at the start or the end of a sample
+                if (k < 24) e = static_cast<float>(k) / 24.0f;
+                else if (k + 200 > v.frames) e = static_cast<float>(v.frames - k) / 200.0f;
+                return e * (static_cast<float>(v.data[k]) * (1.0f - f) + static_cast<float>(v.data[k + 1]) * f) / 32768.0f;
             };
             v.lpl += (at(pl) - v.lpl) * v.al;
             v.lpr += (at(pr) - v.lpr) * v.ar;
@@ -85,6 +89,8 @@ void fill(int16_t* out) {
 }
 
 DWORD WINAPI mixer(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    _mm_setcsr(_mm_getcsr() | 0x8040);                          // flush denormals to zero: the reverb tail would otherwise slow the thread down
     while (g_run.load()) {
         WaitForSingleObject(g_ev, 50);
         for (int b = 0; b < kBufs; ++b)
