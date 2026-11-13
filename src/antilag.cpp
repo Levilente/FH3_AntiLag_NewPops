@@ -34,6 +34,8 @@
 bool sound_init(const char* type, float volume);
 void sound_play(int strength);
 void sound_shutdown();
+void sound_set_type(const char* type);
+#include "car_engines.inc"
 
 namespace {
 
@@ -336,6 +338,18 @@ void watch_car(char* car, char* iface) {
         g_al_retention.store(value_for(garage, kRetention));
         g_al_cutoff.store(value_for(garage, kCutoff));
         g_al_pop.store(value_for(garage, kPop));
+        {
+            static uint32_t last_garage = 0;
+            const int ordinal = g_api->upgrade_car_model ? g_api->upgrade_car_model(static_cast<int32_t>(garage)) : 0;
+            static int last_ordinal = -1;
+            if (garage != last_garage || ordinal != last_ordinal) {
+                last_garage = garage; last_ordinal = ordinal;
+                const char* t = "";
+                for (const auto& e : kCarEngines) if (e.ordinal == ordinal) { t = e.type; break; }
+                sound_set_type(t);
+                say_always("anti-lag: pop sound for car %d: %s", ordinal, *t ? t : "all");
+            }
+        }
         g_al_dyn.store(iface - kIfaceToDyn);
         g_al_car.store(car);
     } else {
@@ -586,7 +600,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
     g_native_fx = cfg_int(L"AntiLag", L"NativeEffects", 1) != 0;
     {
-        const std::string type = cfg_str(L"AntiLag", L"Sound", L"All");
+        const std::string type = cfg_str(L"AntiLag", L"Sound", L"Auto");
         const int vol = cfg_int(L"AntiLag", L"SoundVolume", 80);
         if (cfg_int(L"AntiLag", L"PopSound", 1) && !sound_init(type.c_str(), static_cast<float>(vol) / 100.0f)) say_always("anti-lag: the pop sound could not start");
     }

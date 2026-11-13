@@ -18,8 +18,9 @@ namespace {
 struct Sample { std::string type; const int16_t* data; uint32_t frames; };
 std::vector<Sample> g_samples;
 std::vector<int> g_pick;                       // indices of the samples in use
+std::string g_type_cfg = "Auto";                // Auto (by the car), All, or one type
 
-struct Voice { const int16_t* data = nullptr; uint32_t frames = 0; double pos = 0, step = 1; float gl = 0, gr = 0; };
+struct Voice { const int16_t* data = nullptr; uint32_t frames = 0; double pos = 0, step = 1; float gl = 0, gr = 0; double dl = 0, dr = 0; float lpl = 0, lpr = 0, al = 1, ar = 1; };
 constexpr int kVoices = 16, kRate = 44100, kBuf = 512, kBufs = 4;
 Voice g_voices[kVoices];
 SRWLOCK g_lock = SRWLOCK_INIT;
@@ -32,28 +33,54 @@ std::atomic<float> g_volume{0.8f};
 uint64_t g_rng = 88172645463325252ull;
 double rnd() { g_rng ^= g_rng >> 12; g_rng ^= g_rng << 25; g_rng ^= g_rng >> 27; return static_cast<double>((g_rng * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0; }
 
+// A small reverb (Schroeder: parallel combs into two allpasses) gives the pops a room to be in.
+struct Comb { std::vector<float> b; size_t i = 0; float lp = 0; float proc(float x, float fb, float damp) { float y = b[i]; lp = y * (1 - damp) + lp * damp; b[i] = x + lp * fb; if (++i >= b.size()) i = 0; return y; } };
+struct Allpass { std::vector<float> b; size_t i = 0; float proc(float x) { float y = b[i]; b[i] = x + y * 0.5f; float o = y - x; if (++i >= b.size()) i = 0; return o; } };
+Comb g_combL[4], g_combR[4];
+Allpass g_apL[2], g_apR[2];
+void reverb_init() {
+    const size_t cl[4] = {1116, 1188, 1277, 1356};
+    for (int i = 0; i < 4; ++i) { g_combL[i].b.assign(cl[i], 0.0f); g_combR[i].b.assign(cl[i] + 23, 0.0f); }
+    const size_t al[2] = {556, 441};
+    for (int i = 0; i < 2; ++i) { g_apL[i].b.assign(al[i], 0.0f); g_apR[i].b.assign(al[i] + 23, 0.0f); }
+}
+
 void fill(int16_t* out) {
     float mix[kBuf * 2] = {};
     AcquireSRWLockExclusive(&g_lock);
     for (Voice& v : g_voices) {
         if (!v.data) continue;
         for (int i = 0; i < kBuf; ++i) {
-            const uint32_t p = static_cast<uint32_t>(v.pos);
-            if (p + 1 >= v.frames) { v.data = nullptr; break; }
-            const float f = static_cast<float>(v.pos - p);
-            const float s = (static_cast<float>(v.data[p]) * (1.0f - f) + static_cast<float>(v.data[p + 1]) * f) / 32768.0f;
-            mix[i * 2] += s * v.gl;
-            mix[i * 2 + 1] += s * v.gr;
+            // each ear reads the sample a little later (the far ear: interaural delay) and a little duller (the head shadows high notes)
+            const double pl = v.pos - v.dl, pr = v.pos - v.dr;
+            auto at = [&](double p) -> float {
+                if (p < 0) return 0.0f;
+                const uint32_t k = static_cast<uint32_t>(p);
+                if (k + 1 >= v.frames) return 0.0f;
+                const float f = static_cast<float>(p - k);
+                return (static_cast<float>(v.data[k]) * (1.0f - f) + static_cast<float>(v.data[k + 1]) * f) / 32768.0f;
+            };
+            v.lpl += (at(pl) - v.lpl) * v.al;
+            v.lpr += (at(pr) - v.lpr) * v.ar;
+            mix[i * 2] += v.lpl * v.gl;
+            mix[i * 2 + 1] += v.lpr * v.gr;
             v.pos += v.step;
+            if (v.pos >= v.frames + 40) { v.data = nullptr; break; }
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
-    for (int i = 0; i < kBuf * 2; ++i) {
-        float x = mix[i];
-        x = x / (1.0f + std::fabs(x) * 0.6f) * 1.3f;            // soft clip
-        if (x > 1.0f) x = 1.0f;
-        if (x < -1.0f) x = -1.0f;
-        out[i] = static_cast<int16_t>(x * 32760.0f);
+    for (int i = 0; i < kBuf; ++i) {
+        const float dry_l = mix[i * 2], dry_r = mix[i * 2 + 1], in = (dry_l + dry_r) * 0.18f;
+        float wl = 0, wr = 0;
+        for (int c = 0; c < 4; ++c) { wl += g_combL[c].proc(in, 0.80f, 0.35f); wr += g_combR[c].proc(in, 0.80f, 0.35f); }
+        for (int a = 0; a < 2; ++a) { wl = g_apL[a].proc(wl); wr = g_apR[a].proc(wr); }
+        float l = dry_l + wl * 0.55f, r = dry_r + wr * 0.55f;
+        l = l / (1.0f + std::fabs(l) * 0.6f) * 1.3f;            // soft clip
+        r = r / (1.0f + std::fabs(r) * 0.6f) * 1.3f;
+        l = l > 1.0f ? 1.0f : (l < -1.0f ? -1.0f : l);
+        r = r > 1.0f ? 1.0f : (r < -1.0f ? -1.0f : r);
+        out[i * 2] = static_cast<int16_t>(l * 32760.0f);
+        out[i * 2 + 1] = static_cast<int16_t>(r * 32760.0f);
     }
 }
 
@@ -66,6 +93,19 @@ DWORD WINAPI mixer(LPVOID) {
     return 0;
 }
 }  // namespace
+
+// The pop sound type for the car being driven ("" or an unknown name = all of them). With Sound=<type> in the ini that type always wins.
+void sound_set_type(const char* type) {
+    if (_stricmp(g_type_cfg.c_str(), "Auto") != 0 && _stricmp(g_type_cfg.c_str(), "All") != 0) type = g_type_cfg.c_str();
+    else if (_stricmp(g_type_cfg.c_str(), "All") == 0) type = "";
+    std::vector<int> pick;
+    for (size_t i = 0; i < g_samples.size(); ++i)
+        if (!type || !*type || _stricmp(g_samples[i].type.c_str(), type) == 0) pick.push_back(static_cast<int>(i));
+    if (pick.empty()) for (size_t i = 0; i < g_samples.size(); ++i) pick.push_back(static_cast<int>(i));
+    AcquireSRWLockExclusive(&g_lock);
+    g_pick.swap(pick);
+    ReleaseSRWLockExclusive(&g_lock);
+}
 
 bool sound_init(const char* type, float volume) {
     if (g_run.load()) return true;
@@ -83,11 +123,9 @@ bool sound_init(const char* type, float volume) {
         g_samples.push_back({t, reinterpret_cast<const int16_t*>(p + 16), frames});
         p += 16 + static_cast<size_t>(frames) * 2;
     }
-    g_pick.clear();
-    const bool all = !type || !*type || _stricmp(type, "All") == 0;
-    for (size_t i = 0; i < g_samples.size(); ++i)
-        if (all || _stricmp(g_samples[i].type.c_str(), type) == 0) g_pick.push_back(static_cast<int>(i));
-    if (g_pick.empty()) for (size_t i = 0; i < g_samples.size(); ++i) g_pick.push_back(static_cast<int>(i));
+    g_type_cfg = (type && *type) ? type : "Auto";
+    sound_set_type(_stricmp(g_type_cfg.c_str(), "Auto") == 0 ? "" : g_type_cfg.c_str());
+    reverb_init();
     g_volume.store(volume);
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
@@ -110,22 +148,30 @@ bool sound_init(const char* type, float volume) {
     return g_thread != nullptr;
 }
 
-// strength 1 = soft, 2 = normal, 3 = big. rpm_scale shifts the pitch a little (0.9 .. 1.1).
+// strength 1 = soft, 2 = normal, 3 = big. Each pop comes from one of the car's pipes: left or right of the middle, a bit behind the listener.
 void sound_play(int strength) {
-    if (!g_run.load() || g_pick.empty()) return;
-    const Sample& s = g_samples[static_cast<size_t>(g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()])];
+    if (!g_run.load()) return;
     const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);
     const float gain = base * g_volume.load() * static_cast<float>(0.8 + 0.4 * rnd());
-    const float pan  = static_cast<float>(rnd() * 0.5 - 0.25);
+    const double side = (rnd() < 0.5 ? -1.0 : 1.0) * (0.25 + 0.55 * rnd());   // -1 left .. +1 right
     AcquireSRWLockExclusive(&g_lock);
+    if (g_pick.empty()) { ReleaseSRWLockExclusive(&g_lock); return; }
+    const Sample& s = g_samples[static_cast<size_t>(g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()])];
     Voice* slot = &g_voices[0];
     for (Voice& v : g_voices) if (!v.data) { slot = &v; break; }
     slot->data = s.data;
     slot->frames = s.frames;
     slot->pos = 0;
     slot->step = (strength >= 3 ? 0.92 : 1.0) * (0.88 + 0.24 * rnd());
-    slot->gl = gain * (1.0f - pan * 0.5f);
-    slot->gr = gain * (1.0f + pan * 0.5f);
+    const double far_side = side;                                   // >0: the source is on the right, the left ear is the far one
+    const float near_g = 1.0f, far_g = static_cast<float>(1.0 - 0.45 * std::fabs(side));
+    slot->gl = gain * (far_side > 0 ? far_g : near_g);
+    slot->gr = gain * (far_side > 0 ? near_g : far_g);
+    slot->dl = far_side > 0 ? 24.0 * std::fabs(side) : 0.0;           // up to about 0.5 ms later at the far ear
+    slot->dr = far_side > 0 ? 0.0 : 24.0 * std::fabs(side);
+    slot->al = far_side > 0 ? static_cast<float>(1.0 - 0.65 * std::fabs(side)) : 1.0f;
+    slot->ar = far_side > 0 ? 1.0f : static_cast<float>(1.0 - 0.65 * std::fabs(side));
+    slot->lpl = slot->lpr = 0.0f;
     ReleaseSRWLockExclusive(&g_lock);
 }
 
