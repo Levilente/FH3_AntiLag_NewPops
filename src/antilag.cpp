@@ -419,6 +419,21 @@ uint64_t detour_car_update(void* self, float dt) {
 typedef void (*BurbleFn)(void*, float, void**);
 BurbleFn g_orig_burble = nullptr;
 double g_last_pop = 0;
+double g_next_gap = 0;
+uint64_t g_rng = 0x9E3779B97F4A7C15ull;
+double rnd01() {                                   // xorshift64*, seeded from the high resolution clock (GetTickCount64 steps by 15 ms: that made the pops look like a metronome)
+    if (g_rng == 0x9E3779B97F4A7C15ull) { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_rng ^= static_cast<uint64_t>(q.QuadPart) * 0xD6E8FEB86659FD93ull; }
+    g_rng ^= g_rng >> 12; g_rng ^= g_rng << 25; g_rng ^= g_rng >> 27;
+    return static_cast<double>((g_rng * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0;
+}
+// Time to the next pop: mostly uneven (0.5x to 2x the setting), sometimes a quick burst of two or three, sometimes a gap.
+double next_gap(double base) {
+    const double r = rnd01();
+    if (r < 0.20) return base * (0.15 + 0.25 * rnd01());
+    if (r < 0.32) return base * (2.2 + 2.8 * rnd01());
+    const double u = rnd01();
+    return base * (0.5 + 1.6 * u * u);
+}
 void detour_burble(void* self, float dt, void** iface) {
     g_orig_burble(self, dt, iface);
     char* car = g_al_car.load();
@@ -433,10 +448,13 @@ void detour_burble(void* self, float dt, void** iface) {
         }
         if (want && *ev == 0) {
             const double now = now_ms();
-            const double gap = static_cast<double>(g_al_pop.load());
-            if (now - g_last_pop >= gap * (0.6 + 0.8 * static_cast<double>(GetTickCount64() % 100) / 100.0)) {
-                g_last_pop = now;
-                *ev = (GetTickCount64() % 100) < 40 ? 3 : 2;
+            const double base = static_cast<double>(g_al_pop.load());
+            if (g_next_gap <= 0) g_next_gap = next_gap(base);
+            if (now - g_last_pop >= g_next_gap) {
+                g_last_pop  = now;
+                g_next_gap  = next_gap(base);
+                const double k = rnd01();
+                *ev = k < 0.12 ? 1 : (k < 0.62 ? 2 : 3);   // soft pop, normal, big flame
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
