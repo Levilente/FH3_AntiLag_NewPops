@@ -121,8 +121,12 @@ void set_value(uint32_t garage, int s, int v) {
 
 // Does the car (garage id) have the anti-lag turbo? Learnt while the car is driven (the marker is found in its physics objects);
 // a car not seen yet shows the rows, so the player can always reach them.
-std::atomic<char*> g_al_dyn{nullptr};   // the player's CCarDynamics, set while its car has the anti-lag turbo
-std::atomic<int> g_al_decay{6000}, g_al_retention{85}, g_al_cutoff{1800};
+std::atomic<char*> g_al_dyn{nullptr};
+std::atomic<bool> g_al_holding{false};   // the turbo hook is holding the boost right now
+constexpr size_t kCarBurbleTimer = 0x7490;     // BurbleBackfirePhysics: burble window (ms, counts down)
+constexpr size_t kCarBurbleRand  = 0x74F8;     // BurbleBackfirePhysics: random time to the next pop (ms)
+   // the player's CCarDynamics, set while its car has the anti-lag turbo
+std::atomic<int> g_al_decay{6000}, g_al_retention{85}, g_al_cutoff{1800}, g_al_pop{140};
 CRITICAL_SECTION g_cs;
 std::map<uint32_t, bool> g_has;
 bool car_has_kit() {
@@ -315,6 +319,7 @@ void watch_car(char* car, char* iface) {
         g_al_decay.store(value_for(garage, kDecay));
         g_al_retention.store(value_for(garage, kRetention));
         g_al_cutoff.store(value_for(garage, kCutoff));
+        g_al_pop.store(value_for(garage, kPop));
         g_al_dyn.store(iface - kIfaceToDyn);
     } else {
         g_al_dyn.store(nullptr);
@@ -340,6 +345,7 @@ TurboStepFn g_orig_turbo = nullptr;
 uint64_t detour_turbo(void* self, float dt) {
     const uint64_t r = g_orig_turbo(self, dt);
     if (self != g_al_dyn.load() || g_stop.load()) return r;
+    g_al_holding.store(false);
     __try {
         char* d       = static_cast<char*>(self);
         float* state  = reinterpret_cast<float*>(d + kDynTurboState);
@@ -355,7 +361,9 @@ uint64_t detour_turbo(void* self, float dt) {
             const double since = now_ms() - g_lift_ms;
             const float cutoff = static_cast<float>(g_al_cutoff.load());
             if (rpm >= cutoff && since < g_al_decay.load()) {
-                const float k = (g_al_retention.load() / 100.0f) * static_cast<float>(1.0 - since / g_al_decay.load());
+                const double x = since / g_al_decay.load();   // 0..1; exponential bleed-off: fast at first, long tail
+                const float k = (g_al_retention.load() / 100.0f) * static_cast<float>((std::exp(-3.0 * x) - std::exp(-3.0)) / (1.0 - std::exp(-3.0)));
+                g_al_holding.store(true);
                 const float keep = g_peak * k;
                 float* boost         = reinterpret_cast<float*>(d + kDynBoost);
                 const float bmin     = *reinterpret_cast<const float*>(d + 0xEF4);   // boost at rest
@@ -392,6 +400,14 @@ uint64_t detour_car_update(void* self, float dt) {
     __try {
         char* iface = *reinterpret_cast<char**>(car + kOffIface);
         if (iface && (static_cast<void*>(car) == hud || static_cast<void*>(iface) == hud) && GetTickCount64() - g_hud_tick.load() < 600) { watch_car(car, iface); rec_frame(car, iface); }
+        if (iface && g_al_holding.load() && static_cast<void*>(iface - kIfaceToDyn) == static_cast<void*>(g_al_dyn.load())) {
+            // keep the game's own burble/backfire window open while the anti-lag holds the boost, and shorten the time between pops
+            float* win = reinterpret_cast<float*>(car + kCarBurbleTimer);
+            float* rnd = reinterpret_cast<float*>(car + kCarBurbleRand);
+            if (*win < 300.0f) *win = 700.0f + static_cast<float>(GetTickCount64() % 600);
+            const float pop = static_cast<float>(g_al_pop.load());
+            if (*rnd > pop) *rnd = pop * (0.4f + 0.6f * static_cast<float>(GetTickCount64() % 100) / 100.0f);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static int logged = 0;
         if (logged++ < 5) say_always("anti-lag: a fault in the Car update step");
