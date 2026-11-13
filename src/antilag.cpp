@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+bool sound_init(const char* type, float volume);
+void sound_play(int strength);
+void sound_shutdown();
+
 namespace {
 
 constexpr size_t kOffIface    = 0x71E8;   // Car -> car dynamics interface (CCarDynamics + 0x4B0)
@@ -76,6 +80,16 @@ void say_always(const char* fmt, ...) {
     va_end(ap);
     if (g_api && g_mod) g_api->log(g_mod, line);
 }
+
+std::string cfg_str(const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
+    wchar_t buf[64] = L"";
+    GetPrivateProfileStringW(sec, key, L"", buf, 64, g_cfg_path.c_str());
+    if (!buf[0]) { WritePrivateProfileStringW(sec, key, def, g_cfg_path.c_str()); lstrcpynW(buf, def, 64); }
+    char o[64];
+    WideCharToMultiByte(CP_ACP, 0, buf, -1, o, sizeof o, nullptr, nullptr);
+    return o;
+}
+bool g_native_fx = true;   // keep the game's own backfire effect (flames and its sound) next to ours
 
 int cfg_int(const wchar_t* sec, const wchar_t* key, int def) {
     wchar_t buf[64] = L"";
@@ -457,6 +471,10 @@ void detour_burble(void* self, float dt, void** iface) {
                 *ev = k < 0.12 ? 1 : (k < 0.62 ? 2 : 3);   // soft pop, normal, big flame
             }
         }
+        if (*ev != 0) {                                  // a pop this frame (the game's own or ours): our sound, and the game's effect if wanted
+            sound_play(*ev);
+            if (!g_native_fx) *ev = 0;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -566,6 +584,12 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_cfg_path = std::wstring(api->azimuth_dir) + L"\\fh3-mods\\AntiLag.ini";
     g_extra_price = cfg_int(L"AntiLag", L"ExtraPrice", g_extra_price);
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
+    g_native_fx = cfg_int(L"AntiLag", L"NativeEffects", 1) != 0;
+    {
+        const std::string type = cfg_str(L"AntiLag", L"Sound", L"All");
+        const int vol = cfg_int(L"AntiLag", L"SoundVolume", 80);
+        if (cfg_int(L"AntiLag", L"PopSound", 1) && !sound_init(type.c_str(), static_cast<float>(vol) / 100.0f)) say_always("anti-lag: the pop sound could not start");
+    }
     for (int s = 0; s < kSettingCount; ++s) g_defaults[s] = cfg_int(L"Defaults", kDefs[s].ini, kDefs[s].def);
 
     if (api->api_version >= 10) add_turbo_entries();
@@ -606,6 +630,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
 FH3MOD_EXPORT void fh3mod_shutdown(void) {
     g_stop.store(true);
     g_al_dyn.store(nullptr);
+    sound_shutdown();
     for (HANDLE& h : g_threads)
         if (h) {
             WaitForSingleObject(h, 3000);

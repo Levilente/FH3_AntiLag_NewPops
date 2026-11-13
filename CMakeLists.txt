@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(fh3_antilag VERSION 0.5.1 LANGUAGES C CXX)
+project(fh3_antilag VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,14 +15,17 @@ endif()
 file(STRINGS "${FH3_PLATFORM_DIR}/CMakeLists.txt" _pv REGEX "^project\\(fh3_mod_platform VERSION")
 string(REGEX REPLACE ".*VERSION ([0-9.]+).*" "\\1" FH3_PLATFORM_VERSION "${_pv}")
 
-add_library(antilag SHARED src/antilag.cpp)
+add_library(antilag SHARED src/antilag.cpp src/sound.cpp)
+set_source_files_properties(src/sound.cpp PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sounds.pak")
 target_include_directories(antilag PRIVATE "${FH3_PLATFORM_DIR}/include")
 target_compile_definitions(antilag PRIVATE
     ANTILAG_VERSION="${PROJECT_VERSION}"
+    ANTILAG_SOUNDS_PAK="${CMAKE_CURRENT_SOURCE_DIR}/sounds.pak"
     FH3MOD_PLATFORM_VERSION="${FH3_PLATFORM_VERSION}"
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 if(NOT MSVC)
     target_compile_options(antilag PRIVATE -Wall -Wextra -fms-extensions "$<$<CONFIG:Release>:-O2>")
     target_link_options(antilag PRIVATE -static "$<$<CONFIG:Release>:-s>")
 endif()
+target_link_libraries(antilag PRIVATE winmm)
 set_target_properties(antilag PROPERTIES OUTPUT_NAME AntiLag PREFIX "")
