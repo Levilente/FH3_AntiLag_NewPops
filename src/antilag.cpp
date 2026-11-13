@@ -197,7 +197,10 @@ std::wstring probe_path(const wchar_t* name) {
 }
 
 void write_map(char* car, char* dyn) {
-    FILE* f = _wfopen(probe_path(L"antilag-probe.txt").c_str(), L"w");
+    static unsigned mapn = 0;
+    wchar_t mname[48];
+    _snwprintf(mname, 48, L"antilag-probe-map-%u.txt", ++mapn);
+    FILE* f = _wfopen(probe_path(mname).c_str(), L"w");
     if (!f) return;
     std::fprintf(f, "game base %p\ncar %p\ndyn (CCarDynamics) %p iface %p\n", static_cast<void*>(g_game), static_cast<void*>(car), static_cast<void*>(dyn),
                  static_cast<void*>(dyn + kIfaceToDyn));
@@ -220,7 +223,10 @@ void write_map(char* car, char* dyn) {
 
 void rec_stop() {
     g_rec = false;
-    FILE* f = _wfopen(probe_path(L"antilag-probe.bin").c_str(), L"wb");
+    static unsigned n = 0;
+    wchar_t name[64];
+    _snwprintf(name, 64, L"antilag-probe-%u-%llu.bin", ++n, static_cast<unsigned long long>(GetTickCount64() / 1000));   // never overwrite an earlier recording
+    FILE* f = _wfopen(probe_path(name).c_str(), L"wb");
     if (f) {
         std::fwrite(kMagic, 1, 8, f);
         const uint32_t hdr[4] = {g_rec_frame, static_cast<uint32_t>(kDynSize), static_cast<uint32_t>(kCarSize), static_cast<uint32_t>(g_rec_stride)};
@@ -228,7 +234,7 @@ void rec_stop() {
         std::fwrite(g_rec_buf.data(), 1, g_rec_buf.size(), f);
         std::fclose(f);
     }
-    say_always("probe: recording written, %u frames, %zu bytes (fh3-mods\\antilag-probe.bin)", g_rec_frame, g_rec_buf.size());
+    say_always("probe: recording written, %u frames, %zu bytes (fh3-mods\\antilag-probe-*.bin)", g_rec_frame, g_rec_buf.size());
     g_rec_buf.clear();
     g_rec_buf.shrink_to_fit();
 }
