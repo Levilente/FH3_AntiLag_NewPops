@@ -16,13 +16,14 @@ extern "C" const uint8_t al_sounds_start[];
 extern "C" const uint8_t al_sounds_end[];
 
 namespace {
+constexpr uint32_t kMaxFrames = 13440;   // 280 ms: the long tails of overlapping pops turned into a wash of echoes
 struct Sample { std::string type; const int16_t* data; uint32_t frames; };
 std::vector<Sample> g_samples;
 std::vector<int> g_pick;                       // indices of the samples in use
 std::string g_type_cfg = "Auto";                // Auto (by the car), All, or one type
 
 struct Voice { const int16_t* data = nullptr; uint32_t frames = 0; double pos = 0, step = 1; float gl = 0, gr = 0; double dl = 0, dr = 0; float lpl = 0, lpr = 0, al = 1, ar = 1; };
-constexpr int kVoices = 16, kRate = 48000, kBuf = 480, kBufs = 6;   // 10 ms buffers; the samples are 48 kHz too, so Windows has nothing to resample
+constexpr int kVoices = 6, kRate = 48000, kBuf = 480, kBufs = 6;   // 10 ms buffers; the samples are 48 kHz too, so Windows has nothing to resample
 Voice g_voices[kVoices];
 SRWLOCK g_lock = SRWLOCK_INIT;
 HWAVEOUT g_wo = nullptr;
@@ -31,6 +32,7 @@ int16_t g_pcm[kBufs][kBuf * 2];
 HANDLE g_ev = nullptr, g_thread = nullptr;
 std::atomic<bool> g_run{false};
 std::atomic<float> g_volume{0.8f};
+std::atomic<float> g_reverb{0.1f};
 uint64_t g_rng = 88172645463325252ull;
 double rnd() { g_rng ^= g_rng >> 12; g_rng ^= g_rng << 25; g_rng ^= g_rng >> 27; return static_cast<double>((g_rng * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0; }
 
@@ -61,7 +63,7 @@ void fill(int16_t* out) {
                 const float f = static_cast<float>(p - k);
                 float e = 1.0f;                                             // short fades: no click at the start or the end of a sample
                 if (k < 24) e = static_cast<float>(k) / 24.0f;
-                else if (k + 200 > v.frames) e = static_cast<float>(v.frames - k) / 200.0f;
+                else if (k + 6240 > v.frames) e = static_cast<float>(v.frames - k) / 6240.0f;
                 return e * (static_cast<float>(v.data[k]) * (1.0f - f) + static_cast<float>(v.data[k + 1]) * f) / 32768.0f;
             };
             v.lpl += (at(pl) - v.lpl) * v.al;
@@ -78,7 +80,8 @@ void fill(int16_t* out) {
         float wl = 0, wr = 0;
         for (int c = 0; c < 4; ++c) { wl += g_combL[c].proc(in, 0.80f, 0.35f); wr += g_combR[c].proc(in, 0.80f, 0.35f); }
         for (int a = 0; a < 2; ++a) { wl = g_apL[a].proc(wl); wr = g_apR[a].proc(wr); }
-        float l = dry_l + wl * 0.55f, r = dry_r + wr * 0.55f;
+        const float rv = g_reverb.load();
+        float l = dry_l + wl * rv, r = dry_r + wr * rv;
         l = l / (1.0f + std::fabs(l) * 0.6f) * 1.3f;            // soft clip
         r = r / (1.0f + std::fabs(r) * 0.6f) * 1.3f;
         l = l > 1.0f ? 1.0f : (l < -1.0f ? -1.0f : l);
@@ -113,6 +116,8 @@ void sound_set_type(const char* type) {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+void sound_set_reverb(float amount) { g_reverb.store(amount); }
+
 bool sound_init(const char* type, float volume) {
     if (g_run.load()) return true;
     const uint8_t* p = al_sounds_start;
@@ -126,7 +131,7 @@ bool sound_init(const char* type, float volume) {
         std::memcpy(t, p, 12);
         uint32_t frames;
         std::memcpy(&frames, p + 12, 4);
-        g_samples.push_back({t, reinterpret_cast<const int16_t*>(p + 16), frames});
+        g_samples.push_back({t, reinterpret_cast<const int16_t*>(p + 16), frames < kMaxFrames ? frames : kMaxFrames});
         p += 16 + static_cast<size_t>(frames) * 2;
     }
     g_type_cfg = (type && *type) ? type : "Auto";
@@ -164,7 +169,9 @@ void sound_play(int strength) {
     if (g_pick.empty()) { ReleaseSRWLockExclusive(&g_lock); return; }
     const Sample& s = g_samples[static_cast<size_t>(g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()])];
     Voice* slot = &g_voices[0];
-    for (Voice& v : g_voices) if (!v.data) { slot = &v; break; }
+    bool found = false;
+    for (Voice& v : g_voices) if (!v.data) { slot = &v; found = true; break; }
+    if (!found) for (Voice& v : g_voices) if (v.pos > slot->pos) slot = &v;   // all busy: take the one furthest along
     slot->data = s.data;
     slot->frames = s.frames;
     slot->pos = 0;

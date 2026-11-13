@@ -35,6 +35,7 @@ bool sound_init(const char* type, float volume);
 void sound_play(int strength);
 void sound_shutdown();
 void sound_set_type(const char* type);
+void sound_set_reverb(float amount);
 #include "car_engines.inc"
 
 namespace {
@@ -601,7 +602,8 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_native_fx = cfg_int(L"AntiLag", L"NativeEffects", 1) != 0;
     {
         const std::string type = cfg_str(L"AntiLag", L"Sound", L"Auto");
-        const int vol = cfg_int(L"AntiLag", L"SoundVolume", 80);
+        const int vol = cfg_int(L"AntiLag", L"SoundVolume", 55);
+        sound_set_reverb(static_cast<float>(cfg_int(L"AntiLag", L"Reverb", 8)) / 100.0f);
         if (cfg_int(L"AntiLag", L"PopSound", 1) && !sound_init(type.c_str(), static_cast<float>(vol) / 100.0f)) say_always("anti-lag: the pop sound could not start");
     }
     for (int s = 0; s < kSettingCount; ++s) g_defaults[s] = cfg_int(L"Defaults", kDefs[s].ini, kDefs[s].def);
