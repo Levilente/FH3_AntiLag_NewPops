@@ -123,8 +123,10 @@ void set_value(uint32_t garage, int s, int v) {
 // a car not seen yet shows the rows, so the player can always reach them.
 std::atomic<char*> g_al_dyn{nullptr};
 std::atomic<bool> g_al_holding{false};   // the turbo hook is holding the boost right now
-constexpr size_t kCarBurbleTimer = 0x7490;     // BurbleBackfirePhysics: burble window (ms, counts down)
-constexpr size_t kCarBurbleRand  = 0x74F8;     // BurbleBackfirePhysics: random time to the next pop (ms)
+constexpr size_t kCarBurble = 0x7478;          // BurbleBackfirePhysics object inside the Car (0xA8 bytes); +0xC = the pop event this frame (0 none, 1..3)
+constexpr uintptr_t kRvaBurbleStep = 0x18BBB80; // its update (rcx = object, xmm1 = dt, r8 = pointer to the dynamics interface)
+std::atomic<char*> g_al_car{nullptr};
+std::atomic<bool> g_al_lifted_pop{false};      // lifted, above the cutoff and inside the hold time: pops wanted
    // the player's CCarDynamics, set while its car has the anti-lag turbo
 std::atomic<int> g_al_decay{6000}, g_al_retention{85}, g_al_cutoff{1800}, g_al_pop{140};
 CRITICAL_SECTION g_cs;
@@ -321,6 +323,7 @@ void watch_car(char* car, char* iface) {
         g_al_cutoff.store(value_for(garage, kCutoff));
         g_al_pop.store(value_for(garage, kPop));
         g_al_dyn.store(iface - kIfaceToDyn);
+        g_al_car.store(car);
     } else {
         g_al_dyn.store(nullptr);
     }
@@ -346,6 +349,7 @@ uint64_t detour_turbo(void* self, float dt) {
     const uint64_t r = g_orig_turbo(self, dt);
     if (self != g_al_dyn.load() || g_stop.load()) return r;
     g_al_holding.store(false);
+    g_al_lifted_pop.store(false);
     __try {
         char* d       = static_cast<char*>(self);
         float* state  = reinterpret_cast<float*>(d + kDynTurboState);
@@ -356,11 +360,13 @@ uint64_t detour_turbo(void* self, float dt) {
             g_peak       = *state;
             g_peak_boost = *reinterpret_cast<const float*>(d + kDynBoost);
             g_lifted     = false;
-        } else if (thr < 0.1f && g_peak > 0.0f && lim > 0.0f) {
-            if (!g_lifted) { g_lifted = true; g_lift_ms = now_ms(); }
-            const double since = now_ms() - g_lift_ms;
+        } else if (g_peak > 0.0f && lim > 0.0f) {
+            if (thr < 0.1f && !g_lifted) { g_lifted = true; g_lift_ms = now_ms(); }
+            // once lifted the hold goes on while the throttle comes back up to half, so the game cannot pull the pressure down on a partial throttle
+            const double since = g_lifted ? now_ms() - g_lift_ms : 1e9;
             const float cutoff = static_cast<float>(g_al_cutoff.load());
-            if (rpm >= cutoff && since < g_al_decay.load()) {
+            if (g_lifted && rpm >= cutoff && since < g_al_decay.load()) {
+                if (thr < 0.1f) g_al_lifted_pop.store(true);
                 const double x = since / g_al_decay.load();   // 0..1; stays near the peak, sags slowly, then collapses at the end
                 const double shape = (1.0 - 0.3 * x) * (1.0 - std::pow(x, 8.0));
                 const float k = (g_al_retention.load() / 100.0f) * static_cast<float>(shape);
@@ -401,19 +407,39 @@ uint64_t detour_car_update(void* self, float dt) {
     __try {
         char* iface = *reinterpret_cast<char**>(car + kOffIface);
         if (iface && (static_cast<void*>(car) == hud || static_cast<void*>(iface) == hud) && GetTickCount64() - g_hud_tick.load() < 600) { watch_car(car, iface); rec_frame(car, iface); }
-        if (iface && g_al_holding.load() && static_cast<void*>(iface - kIfaceToDyn) == static_cast<void*>(g_al_dyn.load())) {
-            // keep the game's own burble/backfire window open while the anti-lag holds the boost, and shorten the time between pops
-            float* win = reinterpret_cast<float*>(car + kCarBurbleTimer);
-            float* rnd = reinterpret_cast<float*>(car + kCarBurbleRand);
-            if (*win < 300.0f) *win = 700.0f + static_cast<float>(GetTickCount64() % 600);
-            const float pop = static_cast<float>(g_al_pop.load());
-            if (*rnd > pop) *rnd = pop * (0.4f + 0.6f * static_cast<float>(GetTickCount64() % 100) / 100.0f);
-        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static int logged = 0;
         if (logged++ < 5) say_always("anti-lag: a fault in the Car update step");
     }
     return r;
+}
+
+
+// ---- the pops: the game's own BurbleBackfire update; we add events while the anti-lag works and at the rev limiter --------------------------
+typedef void (*BurbleFn)(void*, float, void**);
+BurbleFn g_orig_burble = nullptr;
+double g_last_pop = 0;
+void detour_burble(void* self, float dt, void** iface) {
+    g_orig_burble(self, dt, iface);
+    char* car = g_al_car.load();
+    if (!car || self != car + kCarBurble || g_stop.load() || !g_al_dyn.load()) return;
+    __try {
+        int* ev = reinterpret_cast<int*>(static_cast<char*>(self) + 0xC);
+        bool want = g_al_lifted_pop.load();
+        if (!want && iface && *iface) {                       // rev limiter on the throttle: the machine gun
+            void* obj = *iface;
+            auto limiter = reinterpret_cast<bool (*)(void*)>((*reinterpret_cast<void***>(obj))[0x4C8 / 8]);
+            want = limiter(obj);
+        }
+        if (want && *ev == 0) {
+            const double now = now_ms();
+            const double gap = static_cast<double>(g_al_pop.load());
+            if (now - g_last_pop >= gap * (0.6 + 0.8 * static_cast<double>(GetTickCount64() % 100) / 100.0)) {
+                g_last_pop = now;
+                *ev = (GetTickCount64() % 100) < 40 ? 3 : 2;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 typedef uint64_t (*HudCtrlFn)(void*, void*, void*, void*);
@@ -438,6 +464,9 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_hud));
     FH3Hook* h3 = g_api->hook_function(g_mod, "Turbo model step (Anti-Lag)", g_game + kRvaTurboStep, reinterpret_cast<void*>(&detour_turbo),
                                        reinterpret_cast<void**>(&g_orig_turbo));
+    FH3Hook* h4 = g_api->hook_function(g_mod, "Burble/backfire update (Anti-Lag)", g_game + kRvaBurbleStep, reinterpret_cast<void*>(&detour_burble),
+                                       reinterpret_cast<void**>(&g_orig_burble));
+    say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
