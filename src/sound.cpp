@@ -365,79 +365,55 @@ void* our_sound(void* sys, int idx) {
 // sound event, down through its nested events and multi instruments to the waveforms): bank_backfires.inc, one row per bank.
 struct BankBf { uint32_t n; uint8_t cnt; uint16_t idx[16]; uint32_t len[16]; };
 #include "bank_backfires.inc"
-typedef int (*GetSubFn)(void*, int, void**);
-GetSubFn g_orig_getsub = nullptr;
 std::unordered_map<void*, int> g_parents;            // sample banks seen: 1 = has backfires (its samples are in g_bf), 0 = not a car bank we know
 std::unordered_map<void*, bool> g_bf;                // the game's backfire samples
 unsigned sub_len(void* sub) { unsigned l = 0; return reinterpret_cast<GetLenFn>(g_fgame + 0x27C0F50)(sub, &l, 2) == 0 ? l : 0; }   // in PCM samples
-void classify_parent(void* parent) {
-    // how many samples: the highest index getSubSound accepts
-    int lo = 0, hi = 1;
-    void* t = nullptr;
-    if (g_orig_getsub(parent, 0, &t) != 0 || !t) { g_parents[parent] = 0; return; }
-    while (hi < 4096 && g_orig_getsub(parent, hi, &t) == 0 && t) { lo = hi; hi *= 2; }
-    while (hi - lo > 1) { const int m = (lo + hi) / 2; if (g_orig_getsub(parent, m, &t) == 0 && t) lo = m; else hi = m; }
-    const uint32_t n = static_cast<uint32_t>(lo + 1);
+// The bank a sample belongs to, by reading memory only (no FMOD call that could change a sound: getSubSound seeks streams, that crashed the game):
+// the sample's parent (+0x310, its subsound parent) holds an array of its samples; the sample's place in it is its index in the bank.
+std::unordered_set<void*> g_seen;
+int g_arr_off = -1;                                     // where the parent keeps the array (found once)
+template <class T> bool rd(const void* p, T* out) { __try { *out = *static_cast<const T*>(p); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+int index_in(void** arr, void* snd, int maxn) {
+    __try { for (int k = 0; k < maxn; ++k) if (arr[k] == snd) return k; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return -1;
+}
+void find_parent(void* snd) {
+    void* parent = nullptr; uintptr_t vt = 0;
+    if (!rd(static_cast<char*>(snd) + 0x310, &parent) || !parent || !rd(snd, &vt)) return;
+    if (g_parents.count(parent)) { return; }
+    void** arr = nullptr; int k = -1;
+    if (g_arr_off >= 0) { if (rd(static_cast<char*>(parent) + g_arr_off, &arr) && arr) k = index_in(arr, snd, 4096); }
+    else {
+        for (int o = 8; o < 0x800 && k < 0; o += 8) {
+            void** a = nullptr;
+            if (!rd(static_cast<char*>(parent) + o, &a) || !a || (reinterpret_cast<uintptr_t>(a) & 7) || reinterpret_cast<uintptr_t>(a) < 0x10000) continue;
+            const int kk = index_in(a, snd, 4096);
+            if (kk >= 0) { arr = a; k = kk; g_arr_off = o; if (g_slog) { char m[96]; std::snprintf(m, sizeof m, "anti-lag: a bank's sample list is at +0x%X", o); g_slog(m); } }
+        }
+    }
+    if (k < 0 || !arr) {                                // not a bank's sample (or not found): leave this bank undecided
+        static int miss = 0;
+        if (miss < 3 && g_slog) { ++miss; g_slog("anti-lag: a played sample's place in its bank was not found"); }
+        return;
+    }
+    // which car bank: the one whose backfire samples (index and length) all match
     for (const BankBf& b : kBankBf) {
-        if (b.n != n) continue;
         bool ok = true;
         void* subs[16] = {};
-        for (int k = 0; k < b.cnt && ok; ++k) ok = g_orig_getsub(parent, b.idx[k], &subs[k]) == 0 && subs[k] && sub_len(subs[k]) == b.len[k];
+        for (int j = 0; j < b.cnt && ok; ++j) {
+            uintptr_t v2 = 0;
+            ok = b.idx[j] < b.n && rd(&arr[b.idx[j]], &subs[j]) && subs[j] && rd(subs[j], &v2) && v2 == vt && sub_len(subs[j]) == b.len[j];
+        }
         if (!ok) continue;
-        for (int k = 0; k < b.cnt; ++k) g_bf[subs[k]] = true;
+        // the bank's size must agree too: the entry after the last sample is not a sample of the same kind
+        for (int j = 0; j < b.cnt; ++j) g_bf[subs[j]] = true;
         g_parents[parent] = 1;
         char m[160];
-        std::snprintf(m, sizeof m, "anti-lag: a car's sample bank (%u samples) loaded: its %d backfire samples play ours", n, b.cnt);
+        std::snprintf(m, sizeof m, "anti-lag: a car's sample bank is playing: its %d backfire samples play ours", b.cnt);
         if (g_slog) g_slog(m);
         return;
     }
-    for (const BankBf& b : kBankBf)
-        if (b.n == n) {
-            void* s0 = nullptr; unsigned l0 = 0;
-            if (g_orig_getsub(parent, b.idx[0], &s0) == 0 && s0) l0 = sub_len(s0);
-            char m[200];
-            std::snprintf(m, sizeof m, "anti-lag: a sample bank of %u samples looked like a car bank but its sample %u is %u long (the table says %u)", n, b.idx[0], l0, b.len[0]);
-            if (g_slog) g_slog(m);
-            break;
-        }
     g_parents[parent] = 0;
-}
-// The bank a sample belongs to: a pointer in the sample's object that is itself a sound whose samples include this one (the subsound parent).
-std::unordered_set<void*> g_seen;
-bool readable_q(const void* p) { MEMORY_BASIC_INFORMATION mb; return p && VirtualQuery(p, &mb, sizeof mb) && mb.State == MEM_COMMIT && !(mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)); }
-void find_parent(void* snd) {
-    const uintptr_t lo = reinterpret_cast<uintptr_t>(g_fgame), hi = lo + 0x6000000;
-    static int dumps = 0;
-    for (int off = 8; off < 0x400; off += 8) {
-        void* q = nullptr;
-        __try {
-            if (!readable_q(static_cast<char*>(snd) + off)) break;
-            q = *reinterpret_cast<void**>(static_cast<char*>(snd) + off);
-            if (!q || q == snd || reinterpret_cast<uintptr_t>(q) < 0x10000 || (reinterpret_cast<uintptr_t>(q) & 7) || !readable_q(q)) continue;
-            const uintptr_t vt = *reinterpret_cast<uintptr_t*>(q);
-            if (vt < lo || vt > hi) continue;
-            if (g_parents.find(q) == g_parents.end()) {
-                void* t = nullptr;
-                if (g_orig_getsub(q, 0, &t) != 0 || !t) continue;     // not a sound with samples
-                classify_parent(q);
-                if (dumps < 4 && g_slog) { ++dumps; char m[160]; std::snprintf(m, sizeof m, "anti-lag: a sample's bank found at +0x%X (%s)", off, g_parents[q] ? "a car bank with backfires" : "not a known car bank"); g_slog(m); }
-            }
-            if (g_parents[q]) return;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-    static int miss = 0;
-    if (miss < 3 && g_slog) { ++miss; unsigned l = 0; __try { l = sub_len(snd); } __except (EXCEPTION_EXECUTE_HANDLER) {} char m[128]; std::snprintf(m, sizeof m, "anti-lag: a played sample (%u long) has no bank we know", l); g_slog(m); }
-}
-int detour_getsub(void* parent, int index, void** sub) {
-    const int r = g_orig_getsub(parent, index, sub);
-    if (r == 0 && parent) {
-        __try {
-            AcquireSRWLockExclusive(&g_stlock);
-            if (g_parents.find(parent) == g_parents.end()) classify_parent(parent);
-            ReleaseSRWLockExclusive(&g_stlock);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { ReleaseSRWLockExclusive(&g_stlock); }
-    }
-    return r;
 }
 int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     void* use = snd;
@@ -460,8 +436,6 @@ int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, voi
     return g_orig_studio_play(use, sys, grp, paused, a5, ch);
 }
 }
-void* sound_getsub_detour() { return reinterpret_cast<void*>(&detour_getsub); }
-void** sound_getsub_orig() { return reinterpret_cast<void**>(&g_orig_getsub); }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }

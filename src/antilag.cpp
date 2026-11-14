@@ -46,8 +46,7 @@ void** sound_studio_orig();
 void sound_mark_pop();
 void sound_native_setup(bool replace, void (*log)(const char*));
 void sound_forget_learned();
-void* sound_getsub_detour();
-void** sound_getsub_orig();
+
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -696,9 +695,7 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h9 = g_api->hook_function(g_mod, "SetValue (research)", g_game + 0x2145760, reinterpret_cast<void*>(&detour_setvalue), reinterpret_cast<void**>(&g_orig_setvalue));
     say("hook: tuning scene %s, SetValue %s", h8 && g_api->enable_hooks(g_mod, h8) ? "on" : "FAILED", h9 && g_api->enable_hooks(g_mod, h9) ? "on" : "FAILED");
     FH3Hook* hs = g_api->hook_function(g_mod, "Studio sound instrument play (Anti-Lag: our pop samples)", g_game + 0x29823B0, sound_studio_detour(), sound_studio_orig());
-    FH3Hook* hg = g_api->hook_function(g_mod, "FMOD Sound::getSubSound (Anti-Lag: which samples are backfires)", g_game + 0x27C12D0, sound_getsub_detour(), sound_getsub_orig());
-    const bool okg = hg && g_api->enable_hooks(g_mod, hg);
-    say_always("anti-lag: native pop sound hooks %s / %s", hs && g_api->enable_hooks(g_mod, hs) ? "on" : "FAILED", okg ? "on" : "FAILED");
+    say_always("anti-lag: native pop sound hook %s", hs && g_api->enable_hooks(g_mod, hs) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
