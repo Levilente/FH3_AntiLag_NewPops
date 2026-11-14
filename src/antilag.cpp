@@ -619,11 +619,16 @@ int detour_ev_start(void* h) {
         if (logged < 6) { ++logged; say_always("anti-lag: muted a game sound inside the backfire routine (from %p)", __builtin_return_address(0)); }
         return 0;
     }
-    if (near_pop && logged < 16) {
+    if (near_pop && logged < 40) {
         ++logged;
-        say_always("anti-lag: an event started %llu ms after a pop, outside the backfire routine (thread %lu, from game+%llX)",
-                   static_cast<unsigned long long>(GetTickCount64() - g_ev_tick.load()), GetCurrentThreadId(),
-                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)));
+        char path[256] = "?";
+        __try {
+            void* desc = nullptr; int n = 0;
+            const int r = reinterpret_cast<int (*)(void*, void**)>(g_game + 0x28A9A60)(h, &desc);        // EventInstance::getDescription
+            if (r == 0 && desc) reinterpret_cast<int (*)(void*, char*, int, int*)>(g_game + 0x28AA690)(desc, path, sizeof path, &n);   // EventDescription::getPath
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        say_always("anti-lag: event %s started %llu ms after a pop (inside the backfire routine: %d)", path,
+                   static_cast<unsigned long long>(GetTickCount64() - g_ev_tick.load()), t_in_backfire);
     }
     return g_orig_ev_start(h);
 }
