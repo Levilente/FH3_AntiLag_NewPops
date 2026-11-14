@@ -331,8 +331,6 @@ typedef int (*GetLenFn)(void*, unsigned*, unsigned);
 namespace {
 StudioPlayFn g_orig_studio_play = nullptr;
 std::atomic<double> g_pop_ms{-1e9};
-struct Stat { uint32_t total = 0, close = 0; unsigned len = 0; bool backfire = false; };
-std::unordered_map<void*, Stat> g_stats;
 SRWLOCK g_stlock = SRWLOCK_INIT;
 std::atomic<bool> g_replace{true};
 void (*g_slog)(const char*) = nullptr;
@@ -362,39 +360,83 @@ void* our_sound(void* sys, int idx) {
     g_rsound[static_cast<size_t>(idx)] = snd;
     return snd;
 }
+// Which of a bank's samples are its backfires is read from the game's own banks (tools/backfire_table.py: the "Backfire" parameter of each car's
+// sound event, down through its nested events and multi instruments to the waveforms): bank_backfires.inc, one row per bank.
+struct BankBf { uint32_t n; uint8_t cnt; uint16_t idx[16]; uint32_t len[16]; };
+#include "bank_backfires.inc"
+typedef int (*GetSubFn)(void*, int, void**);
+GetSubFn g_orig_getsub = nullptr;
+std::unordered_map<void*, int> g_parents;            // sample banks seen: 1 = has backfires (its samples are in g_bf), 0 = not a car bank we know
+std::unordered_map<void*, bool> g_bf;                // the game's backfire samples
+unsigned sub_len(void* sub) { unsigned l = 0; return reinterpret_cast<GetLenFn>(g_fgame + 0x27C0F50)(sub, &l, 2) == 0 ? l : 0; }   // in PCM samples
+void classify_parent(void* parent) {
+    // how many samples: the highest index getSubSound accepts
+    int lo = 0, hi = 1;
+    void* t = nullptr;
+    if (g_orig_getsub(parent, 0, &t) != 0 || !t) { g_parents[parent] = 0; return; }
+    while (hi < 4096 && g_orig_getsub(parent, hi, &t) == 0 && t) { lo = hi; hi *= 2; }
+    while (hi - lo > 1) { const int m = (lo + hi) / 2; if (g_orig_getsub(parent, m, &t) == 0 && t) lo = m; else hi = m; }
+    const uint32_t n = static_cast<uint32_t>(lo + 1);
+    for (const BankBf& b : kBankBf) {
+        if (b.n != n) continue;
+        bool ok = true;
+        void* subs[16] = {};
+        for (int k = 0; k < b.cnt && ok; ++k) ok = g_orig_getsub(parent, b.idx[k], &subs[k]) == 0 && subs[k] && sub_len(subs[k]) == b.len[k];
+        if (!ok) continue;
+        for (int k = 0; k < b.cnt; ++k) g_bf[subs[k]] = true;
+        g_parents[parent] = 1;
+        char m[160];
+        std::snprintf(m, sizeof m, "anti-lag: a car's sample bank (%u samples) loaded: its %d backfire samples play ours", n, b.cnt);
+        if (g_slog) g_slog(m);
+        return;
+    }
+    for (const BankBf& b : kBankBf)
+        if (b.n == n) {
+            void* s0 = nullptr; unsigned l0 = 0;
+            if (g_orig_getsub(parent, b.idx[0], &s0) == 0 && s0) l0 = sub_len(s0);
+            char m[200];
+            std::snprintf(m, sizeof m, "anti-lag: a sample bank of %u samples looked like a car bank but its sample %u is %u long (the table says %u)", n, b.idx[0], l0, b.len[0]);
+            if (g_slog) g_slog(m);
+            break;
+        }
+    g_parents[parent] = 0;
+}
+int detour_getsub(void* parent, int index, void** sub) {
+    const int r = g_orig_getsub(parent, index, sub);
+    if (r == 0 && parent) {
+        __try {
+            AcquireSRWLockExclusive(&g_stlock);
+            if (g_parents.find(parent) == g_parents.end()) classify_parent(parent);
+            ReleaseSRWLockExclusive(&g_stlock);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ReleaseSRWLockExclusive(&g_stlock); }
+    }
+    return r;
+}
 int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     void* use = snd;
     __try {
-        const double now = ms_now();
-        const double since = now - g_pop_ms.load();
-        const bool soon = since >= 0 && since < 200;
-        char msg[200]; msg[0] = 0;
-        AcquireSRWLockExclusive(&g_stlock);
-        Stat& st = g_stats[snd];
-        if (!st.len) { unsigned l = 0; if (reinterpret_cast<GetLenFn>(g_fgame + 0x27C0F50)(snd, &l, 1) == 0) st.len = l ? l : 1; }
-        ++st.total; if (soon) ++st.close;
-        const bool was = st.backfire;
-        st.backfire = st.total >= 4 && st.close * 10 >= st.total * 9 && st.len > 0 && st.len < 1500;
-        if (st.backfire != was) std::snprintf(msg, sizeof msg, "anti-lag: game sound %p (%u ms) %s (%u of %u starts right after a pop)", snd, st.len,
-                                               st.backfire ? "is a backfire: ours plays instead" : "is NOT a backfire after all", st.close, st.total);
-        const bool rep = st.backfire && g_replace.load();
-        ReleaseSRWLockExclusive(&g_stlock);
-        if (msg[0] && g_slog) g_slog(msg);
-        if (rep && !g_pick.empty()) {
+        AcquireSRWLockShared(&g_stlock);
+        const bool bf = g_bf.find(snd) != g_bf.end();
+        ReleaseSRWLockShared(&g_stlock);
+        if (bf && g_replace.load() && !g_pick.empty()) {
             AcquireSRWLockExclusive(&g_lock);
             const int idx = g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()];
             ReleaseSRWLockExclusive(&g_lock);
             if (void* o = our_sound(sys, idx)) use = o;
+            static int logged = 0;
+            if (logged < 3 && g_slog) { ++logged; g_slog("anti-lag: the game plays a backfire sample: ours instead"); }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { use = snd; }
     return g_orig_studio_play(use, sys, grp, paused, a5, ch);
 }
 }
+void* sound_getsub_detour() { return reinterpret_cast<void*>(&detour_getsub); }
+void** sound_getsub_orig() { return reinterpret_cast<void**>(&g_orig_getsub); }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }
 void sound_native_setup(bool replace, void (*log)(const char*)) { g_replace.store(replace); g_slog = log; }
-void sound_forget_learned() { AcquireSRWLockExclusive(&g_stlock); g_stats.clear(); ReleaseSRWLockExclusive(&g_stlock); }
+void sound_forget_learned() {}
 
 // strength 1 = soft, 2 = normal, 3 = big. When pos_ok, (lx, ly, lz) is the pipe's position in the listener's own frame (x right, y up, z ahead, metres);
 // otherwise the pop comes from a random pipe a bit behind the listener.
