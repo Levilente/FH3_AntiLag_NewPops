@@ -47,6 +47,8 @@ void sound_mark_pop();
 void sound_native_setup(bool replace, void (*log)(const char*));
 void sound_forget_learned();
 void sound_set_dump_path(const wchar_t* p);
+void* sound_create_detour();
+void** sound_create_orig();
 
 void sound_shutdown();
 void sound_set_type(const char* type);
@@ -696,6 +698,8 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h9 = g_api->hook_function(g_mod, "SetValue (research)", g_game + 0x2145760, reinterpret_cast<void*>(&detour_setvalue), reinterpret_cast<void**>(&g_orig_setvalue));
     say("hook: tuning scene %s, SetValue %s", h8 && g_api->enable_hooks(g_mod, h8) ? "on" : "FAILED", h9 && g_api->enable_hooks(g_mod, h9) ? "on" : "FAILED");
     FH3Hook* hs = g_api->hook_function(g_mod, "Studio sound instrument play (Anti-Lag: our pop samples)", g_game + 0x29823B0, sound_studio_detour(), sound_studio_orig());
+    FH3Hook* hc = g_api->hook_function(g_mod, "FMOD System::createSound (research)", g_game + 0x27BE3F0, sound_create_detour(), sound_create_orig());
+    say_always("anti-lag: createSound research hook %s", hc && g_api->enable_hooks(g_mod, hc) ? "on" : "FAILED");
     say_always("anti-lag: native pop sound hook %s", hs && g_api->enable_hooks(g_mod, hs) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
@@ -781,7 +785,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
     g_flames = cfg_int(L"AntiLag", L"Flames", 1) != 0;
     g_native = cfg_int(L"AntiLag", L"Native", 1) != 0;
-    sound_set_dump_path(probe_path(L"antilag-snd.bin").c_str());
+    sound_set_dump_path(probe_path(L"antilag-create.txt").c_str());
     sound_native_setup(cfg_int(L"AntiLag", L"PopSound", 1) != 0, [](const char* m) { say_always("%s", m); });
     sound_fmod_set_relpos(&src_relpos);
     {

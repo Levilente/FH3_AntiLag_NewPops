@@ -385,6 +385,27 @@ template <class T> bool rd(const void* p, T* out) {
     *out = *static_cast<const T*>(p);
     return true;
 }
+
+// research: how Studio creates the sounds of the banks (name, mode, exinfo), to fh3-mods\antilag-create.txt
+typedef int (*CreateFn)(void*, const char*, unsigned, unsigned char*, void**);
+CreateFn g_orig_create = nullptr;
+wchar_t g_cpath[MAX_PATH] = L"";
+int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
+    const int r = g_orig_create(sys, name, mode, ex, out);
+    static int n = 0;
+    if (n < 400 && g_cpath[0]) {
+        ++n;
+        if (FILE* f = _wfopen(g_cpath, n == 1 ? L"w" : L"a")) {
+            char nm[200] = "(memory)";
+            if (!(mode & 0x800) && name && readable_span(name) > 0) { size_t i = 0; for (; i < 199 && name[i]; ++i) nm[i] = name[i]; nm[i] = 0; }
+            std::fprintf(f, "r=%d mode=%08X name=%s out=%p ex:", r, mode, nm, out ? *out : nullptr);
+            if (ex && readable_span(ex) >= 0xE8) for (int i = 0; i < 0xE8; i += 4) std::fprintf(f, " %X", *reinterpret_cast<unsigned*>(ex + i));
+            std::fprintf(f, "\n");
+            std::fclose(f);
+        }
+    }
+    return r;
+}
 void find_parent(void* snd) {
     const unsigned len = sub_len(snd);
     if (len == 0 || len > 72000) return;                 // backfires are short: nothing else is looked at
@@ -447,7 +468,9 @@ int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, voi
 }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
-void sound_set_dump_path(const wchar_t*) {}
+void sound_set_dump_path(const wchar_t* p) { wcsncpy(g_cpath, p, MAX_PATH - 1); }
+void* sound_create_detour() { return reinterpret_cast<void*>(&detour_create); }
+void** sound_create_orig() { return reinterpret_cast<void**>(&g_orig_create); }
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }
 void sound_native_setup(bool replace, void (*log)(const char*)) { g_replace.store(replace); g_slog = log; }
 void sound_forget_learned() {}
