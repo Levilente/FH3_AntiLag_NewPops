@@ -363,15 +363,13 @@ void* our_sound(void* sys, int idx) {
 }
 // Which of a bank's samples are its backfires is read from the game's own banks (tools/backfire_table.py: the "Backfire" parameter of each car's
 // sound event, down through its nested events and multi instruments to the waveforms): bank_backfires.inc, one row per bank.
-struct BankBf { uint32_t n; uint8_t cnt; uint16_t idx[16]; uint32_t len[16]; };
+struct BankBf { uint32_t off, len; uint8_t cnt; uint16_t idx[16]; };
 #include "bank_backfires.inc"
 std::unordered_map<void*, int> g_parents;            // sample banks seen: 1 = has backfires (its samples are in g_bf), 0 = not a car bank we know
 std::unordered_map<void*, bool> g_bf;                // the game's backfire samples
-unsigned sub_len(void* sub) { unsigned l = 0; return reinterpret_cast<GetLenFn>(g_fgame + 0x27C0F50)(sub, &l, 2) == 0 ? l : 0; }   // in PCM samples
 // The bank a sample belongs to, by reading memory only (no FMOD call that could change a sound: getSubSound seeks streams, that crashed the game):
 // the sample's parent (+0x310, its subsound parent) holds an array of its samples; the sample's place in it is its index in the bank.
 std::unordered_set<void*> g_seen;
-int g_arr_off = -1;                                     // where the parent keeps the array (found once)
 // Only memory that is committed, readable and not a guard page (a stack's guard page touched by a stray read stops that thread's stack from growing).
 size_t readable_span(const void* p) {
     MEMORY_BASIC_INFORMATION mb;
@@ -386,72 +384,53 @@ template <class T> bool rd(const void* p, T* out) {
     return true;
 }
 
-// research: how Studio creates the sounds of the banks (name, mode, exinfo), to fh3-mods\antilag-create.txt
+// Studio opens every sample of a bank as its own sound: createSound with the bank's file callbacks, the bank's sample data at
+// exinfo.fileoffset (+0x8) with exinfo.length (+0x4), and an inclusion list (+0x28, count +0x30) of one entry: the sample's index in the bank.
+// (offset, length) tells the bank, the index tells the sample: nothing is guessed.
 typedef int (*CreateFn)(void*, const char*, unsigned, unsigned char*, void**);
 CreateFn g_orig_create = nullptr;
-wchar_t g_cpath[MAX_PATH] = L"";
+struct Made { uint32_t off, len, idx; };
+std::unordered_map<void*, Made> g_made;
 int detour_create(void* sys, const char* name, unsigned mode, unsigned char* ex, void** out) {
     const int r = g_orig_create(sys, name, mode, ex, out);
-    static int n = 0;
-    if (n < 400 && g_cpath[0]) {
-        ++n;
-        if (FILE* f = _wfopen(g_cpath, n == 1 ? L"w" : L"a")) {
-            char nm[200] = "(memory)";
-            if (!(mode & 0x800) && name && readable_span(name) > 0) { size_t i = 0; for (; i < 199 && name[i]; ++i) nm[i] = name[i]; nm[i] = 0; }
-            std::fprintf(f, "r=%d mode=%08X name=%s out=%p ex:", r, mode, nm, out ? *out : nullptr);
-            if (ex && readable_span(ex) >= 0xE8) for (int i = 0; i < 0xE8; i += 4) std::fprintf(f, " %X", *reinterpret_cast<unsigned*>(ex + i));
-            std::fprintf(f, "\n");
-            std::fclose(f);
-        }
+    if (r == 0 && out && ex) {
+        __try {
+            if (*reinterpret_cast<int*>(ex) >= 0x38 && *reinterpret_cast<int*>(ex + 0x30) == 1) {
+                const int* incl = *reinterpret_cast<int**>(ex + 0x28);
+                if (incl && *out) {
+                    Made m{ *reinterpret_cast<uint32_t*>(ex + 0x8), *reinterpret_cast<uint32_t*>(ex + 0x4), static_cast<uint32_t>(incl[0]) };
+                    AcquireSRWLockExclusive(&g_stlock);
+                    g_made[*out] = m;
+                    ReleaseSRWLockExclusive(&g_stlock);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     return r;
 }
-void find_parent(void* snd) {
-    const unsigned len = sub_len(snd);
-    if (len == 0 || len > 72000) return;                 // backfires are short: nothing else is looked at
-    // the sample's bank (its subsound parent) is at +0xB0, its index in that bank at +0xB8
-    void* parent = nullptr; uint32_t idx = 0; uintptr_t vt = 0;
-    if (!rd(static_cast<char*>(snd) + 0xB0, &parent) || !parent || !rd(static_cast<char*>(snd) + 0xB8, &idx) || !rd(snd, &vt)) return;
-    if (g_parents.count(parent)) return;
-    // the bank's list of samples: a pointer in the bank whose entry [idx] is this sample
-    void** arr = nullptr;
-    if (g_arr_off >= 0) { void** a2 = nullptr; if (rd(static_cast<char*>(parent) + g_arr_off, &a2) && a2) { void* e = nullptr; if (rd(&a2[idx], &e) && e == snd) arr = a2; } }
-    for (int o = 8; !arr && o < 0x800; o += 8) {
-        void** a2 = nullptr; void* e = nullptr;
-        if (!rd(static_cast<char*>(parent) + o, &a2) || !a2 || (reinterpret_cast<uintptr_t>(a2) & 7)) continue;
-        if (rd(&a2[idx], &e) && e == snd) {
-            arr = a2;
-            if (g_arr_off != o && g_slog) { char m[96]; std::snprintf(m, sizeof m, "anti-lag: a bank's sample list is at +0x%X", o); g_slog(m); }
-            g_arr_off = o;
-        }
-    }
-    if (!arr) { static int nf = 0; if (nf < 3 && g_slog) { ++nf; g_slog("anti-lag: a bank's sample list was not found"); } return; }
-    g_parents[parent] = 0;                               // decided once per bank (whichever of its samples plays first)
+// a played sample: itself, or its parent (+0xB0), is a sound Studio made; is that one a backfire of its bank?
+bool is_backfire(void* snd) {
+    auto it = g_made.find(snd);
+    if (it == g_made.end()) { void* parent = nullptr; if (rd(static_cast<char*>(snd) + 0xB0, &parent) && parent) it = g_made.find(parent); }
+    if (it == g_made.end()) return false;
+    const Made m = it->second;
     for (const BankBf& b : kBankBf) {
-        void* subs[16] = {};
-        bool ok = arr != nullptr;
-        for (int j = 0; j < b.cnt && ok; ++j) {
-            uintptr_t v2 = 0;
-            ok = rd(&arr[b.idx[j]], &subs[j]) && subs[j] && rd(subs[j], &v2) && v2 == vt && sub_len(subs[j]) == b.len[j];
-        }
-        if (!ok) continue;
-        for (int j = 0; j < b.cnt; ++j) g_bf[subs[j]] = true;
-        g_parents[parent] = 1;
-        char m[160];
-        std::snprintf(m, sizeof m, "anti-lag: a car's sample bank is playing: its %d backfire samples play ours", b.cnt);
-        if (g_slog) g_slog(m);
-        return;
+        if (b.off != m.off || b.len != m.len) continue;
+        for (int j = 0; j < b.cnt; ++j)
+            if (b.idx[j] == m.idx) {
+                static int logged = 0;
+                if (logged < 4 && g_slog) { ++logged; char t[128]; std::snprintf(t, sizeof t, "anti-lag: backfire sample %u of a car bank recognised: ours plays in its place", m.idx); g_slog(t); }
+                return true;
+            }
     }
-    static int miss = 0;
-    if (miss < 4 && g_slog) { ++miss; char m[160]; std::snprintf(m, sizeof m, "anti-lag: bank %p (first played sample %u, %u long) is not a car bank we know", parent, idx, len); g_slog(m); }
+    return false;
 }
 int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     void* use = snd;
     __try {
-        AcquireSRWLockExclusive(&g_stlock);
-        if (g_seen.insert(snd).second) find_parent(snd);       // a sample not seen yet: which bank is it from
-        const bool bf = g_bf.find(snd) != g_bf.end();
-        ReleaseSRWLockExclusive(&g_stlock);
+        AcquireSRWLockShared(&g_stlock);
+        const bool bf = is_backfire(snd);                      // decided on every play: sample objects are freed and their memory reused
+        ReleaseSRWLockShared(&g_stlock);
         static int calls = 0;
         if (++calls == 1 && g_slog) g_slog("anti-lag: the game's sound-instrument player runs through us");
         if (bf && g_replace.load() && !g_pick.empty()) {
@@ -468,7 +447,7 @@ int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, voi
 }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
-void sound_set_dump_path(const wchar_t* p) { wcsncpy(g_cpath, p, MAX_PATH - 1); }
+void sound_set_dump_path(const wchar_t*) {}
 void* sound_create_detour() { return reinterpret_cast<void*>(&detour_create); }
 void** sound_create_orig() { return reinterpret_cast<void**>(&g_orig_create); }
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }
