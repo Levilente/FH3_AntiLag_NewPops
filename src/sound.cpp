@@ -181,7 +181,7 @@ void sound_fmod_system(void* sys) { if (sys) g_fsys.store(sys); }
 int sound_fmod_state() { return (g_fmod_on.load() ? 1 : 0) | (g_fsys.load() ? 2 : 0) | (g_fmod_err ? 4 : 0); }
 bool sound_fmod_ready() { return g_fmod_on.load() && g_fsys.load() && !g_fmod_err; }
 
-bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int)) {
+bool sound_play_fmod(int strength, const float pos[3], const float vel_in[3], void (*log)(const char*, int)) {
     if (!sound_fmod_ready() || g_pick.empty()) return false;
     __try {
         void* sys = g_fsys.load();
@@ -212,7 +212,7 @@ bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, 
         int r = reinterpret_cast<PlaySoundFn>(g_fgame + kPlaySound)(sys, g_fsound[static_cast<size_t>(idx)], nullptr, true, &ch);
         if (log) log("playSound", r);
         if (r != 0 || !ch) return false;
-        const float vel[3] = {0, 0, 0};
+        const float vel[3] = { vel_in[0], vel_in[1], vel_in[2] };   // the pipe moves with the car: without this FMOD's Doppler (the camera moves) bends every pop
         r = reinterpret_cast<Set3DFn>(g_fgame + kSet3D)(ch, pos, vel, nullptr);
         if (log) log("set3DAttributes", r);
         const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);

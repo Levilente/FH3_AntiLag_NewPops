@@ -37,7 +37,7 @@ void sound_fmod_attach(char* game, bool enable);
 void sound_fmod_system(void* sys);
 bool sound_fmod_ready();
 int sound_fmod_state();
-bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int));
+bool sound_play_fmod(int strength, const float pos[3], const float vel[3], void (*log)(const char*, int));
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -573,7 +573,12 @@ void play_pop(char* car, int strength) {
         static int why = 0;
         const bool rdy = sound_fmod_ready(), lok = g_listener_ok.load();
         const bool ew = rdy && exhaust_world(car, p);
-        if (ew && sound_play_fmod(strength, p, fmod_log)) return;
+        if (ew) {
+            float v[3] = {0, 0, 0};
+            char* dyn = g_al_dyn.load();
+            if (dyn && readable(dyn, 0x20)) { const float* dv = reinterpret_cast<const float*>(dyn + 0x10); if (finite3(dv)) { v[0] = dv[0]; v[1] = dv[1]; v[2] = dv[2]; } }   // CCarDynamics +0x10: velocity
+            if (sound_play_fmod(strength, p, v, fmod_log)) return;
+        }
         if (why < 8) { ++why; say_always("anti-lag: native pop not used: fmod state %d (1 on, 2 system, 4 error), listener %d, pipe/world %d, dyn %p", sound_fmod_state(), lok ? 1 : 0, ew ? 1 : 0, static_cast<void*>(g_al_dyn.load())); }
     }
     if (g_listener_ok.load() && exhaust_world(car, p)) {
