@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -319,6 +321,80 @@ bool sound_play_fmod(int strength, int tag, void (*log)(const char*, int)) {
         return false;
     }
 }
+
+
+// ---- the native way: the game's car sound event plays its own backfire samples through Studio's sound-instrument player (0x29823B0);
+// those samples are recognised (they start right after the game's pops and only then) and our sample is handed to the player instead.
+// Everything else (where it sounds from, distance, muffling inside the car, reverb, the mix) stays the game's own.
+typedef int (*StudioPlayFn)(void* snd, void* sys, void* grp, bool paused, int a5, void** ch);
+typedef int (*GetLenFn)(void*, unsigned*, unsigned);
+namespace {
+StudioPlayFn g_orig_studio_play = nullptr;
+std::atomic<double> g_pop_ms{-1e9};
+struct Stat { uint32_t total = 0, close = 0; unsigned len = 0; bool backfire = false; };
+std::unordered_map<void*, Stat> g_stats;
+SRWLOCK g_stlock = SRWLOCK_INIT;
+std::atomic<bool> g_replace{true};
+void (*g_slog)(const char*) = nullptr;
+std::vector<void*> g_rsound;             // our samples as FMOD sounds (2D, like the bank's), made on first use
+double ms_now() { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return 1000.0 * static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart); }
+void* our_sound(void* sys, int idx) {
+    if (g_rsound.size() < g_samples.size()) { g_rsound.resize(g_samples.size(), nullptr); g_fpcm.resize(g_samples.size()); }
+    if (g_rsound[static_cast<size_t>(idx)]) return g_rsound[static_cast<size_t>(idx)];
+    const Sample& sm = g_samples[static_cast<size_t>(idx)];
+    std::vector<int16_t>& pcm = g_fpcm[static_cast<size_t>(idx)];
+    pcm.assign(sm.data, sm.data + sm.frames);
+    const float g = g_volume.load() * 1.8f;                               // SoundVolume 55 = the samples as they are
+    for (uint32_t i = 0; i < sm.frames; ++i) {
+        float v = static_cast<float>(pcm[i]) * g;
+        if (i + 480 > sm.frames) v *= static_cast<float>(sm.frames - i) / 480.0f;   // 10 ms fade at the end
+        pcm[i] = static_cast<int16_t>(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
+    }
+    alignas(8) unsigned char ex[0x20] = {};
+    *reinterpret_cast<int*>(ex + 0x00) = 0x18;
+    *reinterpret_cast<unsigned*>(ex + 0x04) = sm.frames * 2;
+    *reinterpret_cast<int*>(ex + 0x0C) = 1;
+    *reinterpret_cast<int*>(ex + 0x10) = 48000;
+    *reinterpret_cast<int*>(ex + 0x14) = 2;
+    void* snd = nullptr;
+    const unsigned mode = 0x1 | 0x8 | 0x100 | 0x800 | 0x1000;            // LOOP_OFF | 2D | CREATESAMPLE | OPENMEMORY | OPENRAW (the bank's instruments are 2D: Studio places them)
+    if (reinterpret_cast<CreateSoundFn>(g_fgame + kCreateSound)(sys, pcm.data(), mode, ex, &snd) != 0) return nullptr;
+    g_rsound[static_cast<size_t>(idx)] = snd;
+    return snd;
+}
+int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
+    void* use = snd;
+    __try {
+        const double now = ms_now();
+        const double since = now - g_pop_ms.load();
+        const bool soon = since >= 0 && since < 200;
+        char msg[200]; msg[0] = 0;
+        AcquireSRWLockExclusive(&g_stlock);
+        Stat& st = g_stats[snd];
+        if (!st.len) { unsigned l = 0; if (reinterpret_cast<GetLenFn>(g_fgame + 0x27C0F50)(snd, &l, 1) == 0) st.len = l ? l : 1; }
+        ++st.total; if (soon) ++st.close;
+        const bool was = st.backfire;
+        st.backfire = st.total >= 4 && st.close * 10 >= st.total * 9 && st.len > 0 && st.len < 1500;
+        if (st.backfire != was) std::snprintf(msg, sizeof msg, "anti-lag: game sound %p (%u ms) %s (%u of %u starts right after a pop)", snd, st.len,
+                                               st.backfire ? "is a backfire: ours plays instead" : "is NOT a backfire after all", st.close, st.total);
+        const bool rep = st.backfire && g_replace.load();
+        ReleaseSRWLockExclusive(&g_stlock);
+        if (msg[0] && g_slog) g_slog(msg);
+        if (rep && !g_pick.empty()) {
+            AcquireSRWLockExclusive(&g_lock);
+            const int idx = g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()];
+            ReleaseSRWLockExclusive(&g_lock);
+            if (void* o = our_sound(sys, idx)) use = o;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { use = snd; }
+    return g_orig_studio_play(use, sys, grp, paused, a5, ch);
+}
+}
+void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
+void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
+void sound_mark_pop() { g_pop_ms.store(ms_now()); }
+void sound_native_setup(bool replace, void (*log)(const char*)) { g_replace.store(replace); g_slog = log; }
+void sound_forget_learned() { AcquireSRWLockExclusive(&g_stlock); g_stats.clear(); ReleaseSRWLockExclusive(&g_stlock); }
 
 // strength 1 = soft, 2 = normal, 3 = big. When pos_ok, (lx, ly, lz) is the pipe's position in the listener's own frame (x right, y up, z ahead, metres);
 // otherwise the pop comes from a random pipe a bit behind the listener.

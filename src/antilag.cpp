@@ -41,6 +41,11 @@ typedef bool (*SoundRelPosFn)(int tag, float out[3]);
 bool sound_play_fmod(int strength, int tag, void (*log)(const char*, int));
 void sound_fmod_set_relpos(SoundRelPosFn f);
 void sound_fmod_update();
+void* sound_studio_detour();
+void** sound_studio_orig();
+void sound_mark_pop();
+void sound_native_setup(bool replace, void (*log)(const char*));
+void sound_forget_learned();
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -356,6 +361,7 @@ void watch_car(char* car, char* iface) {
                 const char* t = "";
                 for (const auto& e : kCarEngines) if (e.ordinal == ordinal) { t = e.type; break; }
                 sound_set_type(t);
+                sound_forget_learned();
                 say_always("anti-lag: pop sound for car %d: %s", ordinal, *t ? t : "all");
             }
         }
@@ -523,6 +529,7 @@ uint32_t gather_tips(char* car, uint8_t* msg, float locs[8][3]) {
 }
 // The flames: the very message the game posts for its own backfire, to the car's deferred presentation (car + 0x73A0, vtable +0x2E8).
 bool g_flames = true;
+bool g_native = true;   // the game plays the pop (its sound event, with our samples swapped in) and its own flames
 bool post_flames(char* car, const uint8_t* msg) {
     if (!*reinterpret_cast<uint8_t*>(car + 0x7269)) return false;     // the game doesn't post for this car either
     void* deferred = *reinterpret_cast<void**>(car + 0x73A0);
@@ -613,8 +620,8 @@ void detour_burble(void* self, float dt, void** iface) {
             }
         }
         if (*ev != 0) {                                  // a pop this frame (the game's own or ours): our sound, and the game's effect if wanted
-            play_pop(car, *ev);     // ours: the sound in the game's mixer at the pipe, the game's flames on the pipes
-            *ev = 0;                // and the game's own backfire (its sound) doesn't happen
+            sound_mark_pop();       // the game's backfire sound samples start right after this: that's how they are recognised and swapped for ours
+            if (!g_native) { play_pop(car, *ev); *ev = 0; }   // the old way (Native=0): our own voice, our flame post
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -686,6 +693,8 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h8 = g_api->hook_function(g_mod, "Tuning scene constructor (research)", g_game + 0x16DF700, reinterpret_cast<void*>(&detour_tune_scene), reinterpret_cast<void**>(&g_orig_tune_scene));
     FH3Hook* h9 = g_api->hook_function(g_mod, "SetValue (research)", g_game + 0x2145760, reinterpret_cast<void*>(&detour_setvalue), reinterpret_cast<void**>(&g_orig_setvalue));
     say("hook: tuning scene %s, SetValue %s", h8 && g_api->enable_hooks(g_mod, h8) ? "on" : "FAILED", h9 && g_api->enable_hooks(g_mod, h9) ? "on" : "FAILED");
+    FH3Hook* hs = g_api->hook_function(g_mod, "Studio sound instrument play (Anti-Lag: our pop samples)", g_game + 0x29823B0, sound_studio_detour(), sound_studio_orig());
+    say_always("anti-lag: native pop sound hook %s", hs && g_api->enable_hooks(g_mod, hs) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
@@ -769,6 +778,8 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_extra_price = cfg_int(L"AntiLag", L"ExtraPrice", g_extra_price);
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
     g_flames = cfg_int(L"AntiLag", L"Flames", 1) != 0;
+    g_native = cfg_int(L"AntiLag", L"Native", 1) != 0;
+    sound_native_setup(cfg_int(L"AntiLag", L"PopSound", 1) != 0, [](const char* m) { say_always("%s", m); });
     sound_fmod_set_relpos(&src_relpos);
     {
         const std::string type = cfg_str(L"AntiLag", L"Sound", L"Auto");
