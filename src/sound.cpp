@@ -385,69 +385,35 @@ template <class T> bool rd(const void* p, T* out) {
     *out = *static_cast<const T*>(p);
     return true;
 }
-int index_in(void** arr, void* snd, int maxn) {
-    const size_t span = readable_span(arr) / sizeof(void*);
-    const int n = static_cast<int>(span < static_cast<size_t>(maxn) ? span : static_cast<size_t>(maxn));
-    for (int k = 0; k < n; ++k) if (arr[k] == snd) return k;
-    return -1;
-}
-// research: the sample object and everything it points to (one level, 0x800 bytes each) to fh3-mods\antilag-snd.bin
-wchar_t g_dump_path[MAX_PATH] = L"";
-void dump_sound(void* snd) {
-    static int n = 0;
-    if (n >= 6 || !g_dump_path[0]) return;
-    ++n;
-    FILE* f = _wfopen(g_dump_path, n == 1 ? L"wb" : L"ab");
-    if (!f) return;
-    auto put = [&](const void* p, size_t sz) {
-        uint64_t a = reinterpret_cast<uint64_t>(p); uint32_t z = static_cast<uint32_t>(sz);
-        std::fwrite(&a, 8, 1, f); std::fwrite(&z, 4, 1, f); std::fwrite(p, 1, sz, f);
-    };
-    const uint32_t mark = 0x534E4421; std::fwrite(&mark, 4, 1, f);
-    const unsigned len = sub_len(snd); std::fwrite(&len, 4, 1, f);
-    if (readable_span(snd) < 0x800) { std::fclose(f); return; }
-    put(snd, 0x800);
-    for (int o = 0; o < 0x800; o += 8) {
-        void* q = *reinterpret_cast<void**>(static_cast<char*>(snd) + o);
-        if (!q || (reinterpret_cast<uintptr_t>(q) & 7)) continue;
-        const size_t sp = readable_span(q);
-        if (sp >= 0x40) put(q, sp < 0x800 ? sp : 0x800);
-    }
-    std::fclose(f);
-}
 void find_parent(void* snd) {
     const unsigned len = sub_len(snd);
     if (len == 0 || len > 72000) return;                 // backfires are short: nothing else is looked at
-    void* parent = nullptr; uintptr_t vt = 0;
-    if (!rd(static_cast<char*>(snd) + 0x310, &parent) || !parent || !rd(snd, &vt)) return;
-    if (g_parents.count(parent)) { return; }
-    g_parents[parent] = 0;                               // decided once per bank, found or not
-    void** arr = nullptr; int k = -1;
-    if (g_arr_off >= 0) { if (rd(static_cast<char*>(parent) + g_arr_off, &arr) && arr) k = index_in(arr, snd, 4096); }
-    else {
-        for (int o = 8; o < 0x400 && k < 0; o += 8) {
-            void** a = nullptr;
-            if (!rd(static_cast<char*>(parent) + o, &a) || !a || (reinterpret_cast<uintptr_t>(a) & 7) || reinterpret_cast<uintptr_t>(a) < 0x10000) continue;
-            const int kk = index_in(a, snd, 4096);
-            if (kk >= 0) { arr = a; k = kk; g_arr_off = o; if (g_slog) { char m[96]; std::snprintf(m, sizeof m, "anti-lag: a bank's sample list is at +0x%X", o); g_slog(m); } }
+    // the sample's bank (its subsound parent) is at +0xB0, its index in that bank at +0xB8
+    void* parent = nullptr; uint32_t idx = 0; uintptr_t vt = 0;
+    if (!rd(static_cast<char*>(snd) + 0xB0, &parent) || !parent || !rd(static_cast<char*>(snd) + 0xB8, &idx) || !rd(snd, &vt)) return;
+    if (g_parents.count(parent)) return;
+    // the bank's list of samples: a pointer in the bank whose entry [idx] is this sample
+    void** arr = nullptr;
+    if (g_arr_off >= 0) { void** a2 = nullptr; if (rd(static_cast<char*>(parent) + g_arr_off, &a2) && a2) { void* e = nullptr; if (rd(&a2[idx], &e) && e == snd) arr = a2; } }
+    for (int o = 8; !arr && o < 0x800; o += 8) {
+        void** a2 = nullptr; void* e = nullptr;
+        if (!rd(static_cast<char*>(parent) + o, &a2) || !a2 || (reinterpret_cast<uintptr_t>(a2) & 7)) continue;
+        if (rd(&a2[idx], &e) && e == snd) {
+            arr = a2;
+            if (g_arr_off != o && g_slog) { char m[96]; std::snprintf(m, sizeof m, "anti-lag: a bank's sample list is at +0x%X", o); g_slog(m); }
+            g_arr_off = o;
         }
     }
-    if (k < 0 || !arr) {                                // not a bank's sample (or not found): leave this bank undecided
-        dump_sound(snd);
-        static int miss = 0;
-        if (miss < 3 && g_slog) { ++miss; g_slog("anti-lag: a played sample's place in its bank was not found"); }
-        return;
-    }
-    // which car bank: the one whose backfire samples (index and length) all match
+    if (!arr) { static int nf = 0; if (nf < 3 && g_slog) { ++nf; g_slog("anti-lag: a bank's sample list was not found"); } return; }
+    g_parents[parent] = 0;                               // decided once per bank (whichever of its samples plays first)
     for (const BankBf& b : kBankBf) {
-        bool ok = true;
         void* subs[16] = {};
+        bool ok = arr != nullptr;
         for (int j = 0; j < b.cnt && ok; ++j) {
             uintptr_t v2 = 0;
-            ok = b.idx[j] < b.n && rd(&arr[b.idx[j]], &subs[j]) && subs[j] && rd(subs[j], &v2) && v2 == vt && sub_len(subs[j]) == b.len[j];
+            ok = rd(&arr[b.idx[j]], &subs[j]) && subs[j] && rd(subs[j], &v2) && v2 == vt && sub_len(subs[j]) == b.len[j];
         }
         if (!ok) continue;
-        // the bank's size must agree too: the entry after the last sample is not a sample of the same kind
         for (int j = 0; j < b.cnt; ++j) g_bf[subs[j]] = true;
         g_parents[parent] = 1;
         char m[160];
@@ -455,7 +421,8 @@ void find_parent(void* snd) {
         if (g_slog) g_slog(m);
         return;
     }
-    g_parents[parent] = 0;
+    static int miss = 0;
+    if (miss < 4 && g_slog) { ++miss; char m[160]; std::snprintf(m, sizeof m, "anti-lag: bank %p (first played sample %u, %u long) is not a car bank we know", parent, idx, len); g_slog(m); }
 }
 int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     void* use = snd;
@@ -480,7 +447,7 @@ int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, voi
 }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
-void sound_set_dump_path(const wchar_t* p) { wcsncpy(g_dump_path, p, MAX_PATH - 1); }
+void sound_set_dump_path(const wchar_t*) {}
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }
 void sound_native_setup(bool replace, void (*log)(const char*)) { g_replace.store(replace); g_slog = log; }
 void sound_forget_learned() {}
