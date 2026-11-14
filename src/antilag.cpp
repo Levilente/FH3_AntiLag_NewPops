@@ -522,11 +522,21 @@ int g_flip_pan = 0;
 // The world position of one of the car's pipes (car + 0x88: eight weak pointers to the exhaust nodes, each node's vtable +0x10 gives its 4x4 matrix).
 bool exhaust_world(char* car, float out[3]) {
     int idx[8], n = 0;
-    for (int i = 0; i < 8; ++i) {
-        char* el = car + 0x88 + i * 0x10;
-        void* obj = *reinterpret_cast<void**>(el);
-        char* ctrl = *reinterpret_cast<char**>(el + 8);
-        if (obj && ctrl && *reinterpret_cast<int*>(ctrl + 8) > 0) idx[n++] = i;
+    for (int attempt = 0; attempt < 2 && !n; ++attempt) {
+        for (int i = 0; i < 8; ++i) {
+            char* el = car + 0x88 + i * 0x10;
+            void* obj = *reinterpret_cast<void**>(el);
+            char* ctrl = *reinterpret_cast<char**>(el + 8);
+            if (obj && ctrl && *reinterpret_cast<int*>(ctrl + 8) > 0) idx[n++] = i;
+        }
+        if (!n && attempt == 0) {
+            // The game only resolves the exhaust locators (car vtable +0x270) while it has a backfire to post; with its own effects off nobody asks, so ask now.
+            static uint64_t last = 0; const uint64_t t = GetTickCount64();
+            if (t - last < 500) break;
+            last = t;
+            auto resolve = reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(car))[0x270 / 8]);
+            resolve(car);
+        }
     }
     if (!n) { static int c = 0; if (c++ < 3) say_always("anti-lag: no live exhaust node on this car"); return false; }
     const int pick = idx[static_cast<size_t>(rnd01() * n) % n];
