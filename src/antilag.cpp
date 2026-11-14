@@ -677,6 +677,42 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
     return r;
 }
 
+// ---- research: the tuning page's tab list (9 fixed tabs built by the scene constructor at 0x16DF700) -----------------------------------------------------------
+thread_local void* t_tune_scene = nullptr;
+typedef void* (*TuneSceneFn)(void*);
+TuneSceneFn g_orig_tune_scene = nullptr;
+typedef void* (*SetValueFn)(void*, void*, void*);
+SetValueFn g_orig_setvalue = nullptr;
+std::atomic<int> g_sv_log{0};
+static uintptr_t rva_of(const void* p) { const uintptr_t a = reinterpret_cast<uintptr_t>(p), b = reinterpret_cast<uintptr_t>(g_game); return a >= b && a < b + 0x6000000 ? a - b : 0; }
+void* detour_setvalue(void* el, void* dp, void* val) {
+    if (t_tune_scene && g_sv_log.load() < 60) {
+        g_sv_log.fetch_add(1);
+        __try {
+            const void* vte = readable(el, 8) ? *reinterpret_cast<void**>(el) : nullptr;
+            const void* vtv = (val && readable(val, 8)) ? *reinterpret_cast<void**>(val) : nullptr;
+            say_always("anti-lag: tuning scene SetValue(el %p vt+%llX, dp %p, val %p vt+%llX)%s", el, static_cast<unsigned long long>(rva_of(vte)), dp, val,
+                       static_cast<unsigned long long>(rva_of(vtv)), el == *reinterpret_cast<void**>(static_cast<char*>(t_tune_scene) + 0x488) ? "  <- the tab list element" : "");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return g_orig_setvalue(el, dp, val);
+}
+void* detour_tune_scene(void* self) {
+    t_tune_scene = self;
+    say_always("anti-lag: tuning scene constructor starts (this %p)", self);
+    void* r = g_orig_tune_scene(self);
+    __try {
+        void* el = *reinterpret_cast<void**>(static_cast<char*>(self) + 0x488);
+        say_always("anti-lag: tuning scene built: tab list element %p; object words:", el);
+        for (int i = 0; i < 0x40 && readable(static_cast<char*>(el) + i * 8, 8); ++i) {
+            const uintptr_t w = *reinterpret_cast<uintptr_t*>(static_cast<char*>(el) + i * 8);
+            if (w) say_always("   el+0x%X = %llX (game+%llX)", i * 8, static_cast<unsigned long long>(w), static_cast<unsigned long long>(rva_of(reinterpret_cast<void*>(w))));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    t_tune_scene = nullptr;
+    return r;
+}
+
 DWORD WINAPI install_hooks(LPVOID) {
     g_game = static_cast<char*>(g_api->wait_for_code(0xFFFFFFFFu));
     if (!g_game) { say_always("the game's code never became ready: no hooks"); return 0; }
@@ -697,6 +733,9 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h7 = g_api->hook_function(g_mod, "FMOD Studio EventInstance::start (Anti-Lag)", g_game + kRvaEventStart, reinterpret_cast<void*>(&detour_ev_start),
                                        reinterpret_cast<void**>(&g_orig_ev_start));
     say("hook: backfire routine %s, event start %s", h6 && g_api->enable_hooks(g_mod, h6) ? "on" : "FAILED", h7 && g_api->enable_hooks(g_mod, h7) ? "on" : "FAILED");
+    FH3Hook* h8 = g_api->hook_function(g_mod, "Tuning scene constructor (research)", g_game + 0x16DF700, reinterpret_cast<void*>(&detour_tune_scene), reinterpret_cast<void**>(&g_orig_tune_scene));
+    FH3Hook* h9 = g_api->hook_function(g_mod, "SetValue (research)", g_game + 0x2145760, reinterpret_cast<void*>(&detour_setvalue), reinterpret_cast<void**>(&g_orig_setvalue));
+    say("hook: tuning scene %s, SetValue %s", h8 && g_api->enable_hooks(g_mod, h8) ? "on" : "FAILED", h9 && g_api->enable_hooks(g_mod, h9) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
