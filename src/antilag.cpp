@@ -46,6 +46,7 @@ void** sound_studio_orig();
 void sound_mark_pop();
 void sound_native_setup(bool replace, void (*log)(const char*));
 void sound_forget_learned();
+void sound_set_dump_path(const wchar_t* p);
 
 void sound_shutdown();
 void sound_set_type(const char* type);
@@ -780,6 +781,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
     g_flames = cfg_int(L"AntiLag", L"Flames", 1) != 0;
     g_native = cfg_int(L"AntiLag", L"Native", 1) != 0;
+    sound_set_dump_path(probe_path(L"antilag-snd.bin").c_str());
     sound_native_setup(cfg_int(L"AntiLag", L"PopSound", 1) != 0, [](const char* m) { say_always("%s", m); });
     sound_fmod_set_relpos(&src_relpos);
     {

@@ -391,6 +391,30 @@ int index_in(void** arr, void* snd, int maxn) {
     for (int k = 0; k < n; ++k) if (arr[k] == snd) return k;
     return -1;
 }
+// research: the sample object and everything it points to (one level, 0x800 bytes each) to fh3-mods\antilag-snd.bin
+wchar_t g_dump_path[MAX_PATH] = L"";
+void dump_sound(void* snd) {
+    static int n = 0;
+    if (n >= 6 || !g_dump_path[0]) return;
+    ++n;
+    FILE* f = _wfopen(g_dump_path, n == 1 ? L"wb" : L"ab");
+    if (!f) return;
+    auto put = [&](const void* p, size_t sz) {
+        uint64_t a = reinterpret_cast<uint64_t>(p); uint32_t z = static_cast<uint32_t>(sz);
+        std::fwrite(&a, 8, 1, f); std::fwrite(&z, 4, 1, f); std::fwrite(p, 1, sz, f);
+    };
+    const uint32_t mark = 0x534E4421; std::fwrite(&mark, 4, 1, f);
+    const unsigned len = sub_len(snd); std::fwrite(&len, 4, 1, f);
+    if (readable_span(snd) < 0x800) { std::fclose(f); return; }
+    put(snd, 0x800);
+    for (int o = 0; o < 0x800; o += 8) {
+        void* q = *reinterpret_cast<void**>(static_cast<char*>(snd) + o);
+        if (!q || (reinterpret_cast<uintptr_t>(q) & 7)) continue;
+        const size_t sp = readable_span(q);
+        if (sp >= 0x40) put(q, sp < 0x800 ? sp : 0x800);
+    }
+    std::fclose(f);
+}
 void find_parent(void* snd) {
     const unsigned len = sub_len(snd);
     if (len == 0 || len > 72000) return;                 // backfires are short: nothing else is looked at
@@ -409,6 +433,7 @@ void find_parent(void* snd) {
         }
     }
     if (k < 0 || !arr) {                                // not a bank's sample (or not found): leave this bank undecided
+        dump_sound(snd);
         static int miss = 0;
         if (miss < 3 && g_slog) { ++miss; g_slog("anti-lag: a played sample's place in its bank was not found"); }
         return;
@@ -455,6 +480,7 @@ int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, voi
 }
 void* sound_studio_detour() { return reinterpret_cast<void*>(&detour_studio_play); }
 void** sound_studio_orig() { return reinterpret_cast<void**>(&g_orig_studio_play); }
+void sound_set_dump_path(const wchar_t* p) { wcsncpy(g_dump_path, p, MAX_PATH - 1); }
 void sound_mark_pop() { g_pop_ms.store(ms_now()); }
 void sound_native_setup(bool replace, void (*log)(const char*)) { g_replace.store(replace); g_slog = log; }
 void sound_forget_learned() {}
