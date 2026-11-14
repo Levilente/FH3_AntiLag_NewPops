@@ -16,7 +16,7 @@ extern "C" const uint8_t al_sounds_start[];
 extern "C" const uint8_t al_sounds_end[];
 
 namespace {
-constexpr uint32_t kMaxFrames = 13440;   // 280 ms: the long tails of overlapping pops turned into a wash of echoes
+constexpr uint32_t kMaxFrames = 96000;   // the whole sample (the longest is 0.74 s): cutting the tails off made every pop sound like a creaking chest
 struct Sample { std::string type; const int16_t* data; uint32_t frames; };
 std::vector<Sample> g_samples;
 std::vector<int> g_pick;                       // indices of the samples in use
@@ -216,8 +216,8 @@ bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, 
         r = reinterpret_cast<Set3DFn>(g_fgame + kSet3D)(ch, pos, vel, nullptr);
         if (log) log("set3DAttributes", r);
         const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);
-        reinterpret_cast<SetFloatFn>(g_fgame + kSetVolume)(ch, base * g_volume.load() * static_cast<float>(0.8 + 0.4 * rnd()));
-        reinterpret_cast<SetFloatFn>(g_fgame + kSetPitch)(ch, static_cast<float>((strength >= 3 ? 0.92 : 1.0) * (0.88 + 0.24 * rnd())));
+        reinterpret_cast<SetFloatFn>(g_fgame + kSetVolume)(ch, base * g_volume.load() * static_cast<float>(0.9 + 0.2 * rnd()));
+        reinterpret_cast<SetFloatFn>(g_fgame + kSetPitch)(ch, static_cast<float>((0.97 + 0.06 * rnd())));
         reinterpret_cast<SetPausedFn>(g_fgame + kSetPaused)(ch, false);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -243,7 +243,7 @@ void sound_play(int strength, bool pos_ok, float lx, float ly, float lz) {
         if (lz < 0) lp -= 0.25f * (-lz / dd);                         // behind the head: duller
         dist_lp = lp < 0.25f ? 0.25f : lp;
     }
-    const float gain = base * g_volume.load() * dist_g * static_cast<float>(0.8 + 0.4 * rnd());
+    const float gain = base * g_volume.load() * dist_g * static_cast<float>(0.9 + 0.2 * rnd());
     AcquireSRWLockExclusive(&g_lock);
     if (g_pick.empty()) { ReleaseSRWLockExclusive(&g_lock); return; }
     const Sample& s = g_samples[static_cast<size_t>(g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()])];
@@ -254,7 +254,7 @@ void sound_play(int strength, bool pos_ok, float lx, float ly, float lz) {
     slot->data = s.data;
     slot->frames = s.frames;
     slot->pos = 0;
-    slot->step = (strength >= 3 ? 0.92 : 1.0) * (0.88 + 0.24 * rnd());
+    slot->step = (0.97 + 0.06 * rnd());
     const double far_side = side;                                   // >0: the source is on the right, the left ear is the far one
     const double as = std::fabs(side) > 1.0 ? 1.0 : std::fabs(side);
     const float near_g = 1.0f, far_g = static_cast<float>(1.0 - 0.45 * as);
