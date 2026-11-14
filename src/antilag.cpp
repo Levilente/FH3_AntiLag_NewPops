@@ -596,6 +596,38 @@ void play_pop(char* car, int strength) {
     sound_play(strength, false, 0, 0, 0);
 }
 
+// ---- the game's own backfire sound is muted (its flame stays): FMOD Studio events started inside the presentation's backfire routine are dropped ----------------
+constexpr uintptr_t kRvaBackfireRoutine = 0x1E741B0;   // CarPresentation backfire (pres, tips, r8, r9): spawns the flames
+constexpr uintptr_t kRvaEventStart      = 0x28A6630;   // FMOD Studio EventInstance::start (handle)
+thread_local int t_in_backfire = 0;
+std::atomic<uint64_t> g_ev_tick{0};
+std::atomic<int> g_mute_native{1};
+typedef uint64_t (*BfRoutineFn)(void*, const void*, void*, void*);
+BfRoutineFn g_orig_bf_routine = nullptr;
+uint64_t detour_bf_routine(void* pres, const void* tips, void* r8, void* r9) {
+    ++t_in_backfire;
+    const uint64_t r = g_orig_bf_routine(pres, tips, r8, r9);
+    --t_in_backfire;
+    return r;
+}
+typedef int (*EvStartFn)(void*);
+EvStartFn g_orig_ev_start = nullptr;
+int detour_ev_start(void* h) {
+    static int logged = 0;
+    const bool near_pop = GetTickCount64() - g_ev_tick.load() < 250;
+    if (t_in_backfire && g_mute_native.load()) {
+        if (logged < 6) { ++logged; say_always("anti-lag: muted a game sound inside the backfire routine (from %p)", __builtin_return_address(0)); }
+        return 0;
+    }
+    if (near_pop && logged < 16) {
+        ++logged;
+        say_always("anti-lag: an event started %llu ms after a pop, outside the backfire routine (thread %lu, from game+%llX)",
+                   static_cast<unsigned long long>(GetTickCount64() - g_ev_tick.load()), GetCurrentThreadId(),
+                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)));
+    }
+    return g_orig_ev_start(h);
+}
+
 void detour_burble(void* self, float dt, void** iface) {
     g_orig_burble(self, dt, iface);
     char* car = g_al_car.load();
@@ -620,6 +652,7 @@ void detour_burble(void* self, float dt, void** iface) {
             }
         }
         if (*ev != 0) {                                  // a pop this frame (the game's own or ours): our sound, and the game's effect if wanted
+            g_ev_tick.store(GetTickCount64());
             play_pop(car, *ev);
             if (!g_native_fx) *ev = 0;
         }
@@ -654,6 +687,11 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h5 = g_api->hook_function(g_mod, "FMOD listener (Anti-Lag: 3D sound)", g_game + kRvaListener, reinterpret_cast<void*>(&detour_listener),
                                        reinterpret_cast<void**>(&g_orig_listener));
     say("hook: listener %s", h5 && g_api->enable_hooks(g_mod, h5) ? "on" : "FAILED");
+    FH3Hook* h6 = g_api->hook_function(g_mod, "CarPresentation backfire (Anti-Lag: mute its sound)", g_game + kRvaBackfireRoutine, reinterpret_cast<void*>(&detour_bf_routine),
+                                       reinterpret_cast<void**>(&g_orig_bf_routine));
+    FH3Hook* h7 = g_api->hook_function(g_mod, "FMOD Studio EventInstance::start (Anti-Lag)", g_game + kRvaEventStart, reinterpret_cast<void*>(&detour_ev_start),
+                                       reinterpret_cast<void**>(&g_orig_ev_start));
+    say("hook: backfire routine %s, event start %s", h6 && g_api->enable_hooks(g_mod, h6) ? "on" : "FAILED", h7 && g_api->enable_hooks(g_mod, h7) ? "on" : "FAILED");
     say("hook: burble %s", h4 && g_api->enable_hooks(g_mod, h4) ? "on" : "FAILED");
     say("hook: turbo step %s", h3 && g_api->enable_hooks(g_mod, h3) ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
