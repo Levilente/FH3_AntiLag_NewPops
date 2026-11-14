@@ -2,7 +2,7 @@
 //
 // A new entry in the game's own turbo upgrade list (Garage > Upgrades > Engine > Turbo / Twin Turbo): after Street, Sport and Race
 // comes "Race Turbo w/ Anti-Lag" (the Race turbo's data with a marker value in TorqueDropOffRPM0, which the mod finds in the car's
-// physics objects to know the car has it). A car with it gets four rows on its Tuning > Springs page (pressure decay, boost
+// physics objects to know the car has it). A car with it gets four rows on its Tuning > Engine tab (pressure decay, boost
 // retention, cutoff RPM, pop interval), saved per garage car in fh3-mods\AntiLag.ini.
 //
 // How the boost works in the game (found from a probe recording and the code): the turbo model's step (game+0x1D82090, rcx = CCarDynamics,
@@ -10,7 +10,7 @@
 // at dyn+0x620 (dyn+0xEF4 to dyn+0xEF8) follows from it. When the throttle (dyn+0x1BD0) is lifted the state decays at once. Anti-lag
 // hooks the step and, while the throttle is lifted above the cutoff RPM, keeps the state from falling below the retained level.
 //
-// A recorder (hotkey F8, development) dumps the
+// A recorder (hotkey F8, development tool) dumps the
 // player car's physics objects every other frame to fh3-mods\antilag-probe.bin (+ a map of the objects in
 // fh3-mods\antilag-probe.txt), so the turbo's boost value and the exhaust-pop trigger can be found. The anti-lag
 // itself helps to find more of the game's turbo/backfire state.
@@ -98,7 +98,12 @@ void say_always(const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-    if (g_api && g_mod) g_api->log(g_mod, line);
+    if (!g_api || !g_mod) return;
+    // Ordinary lines only with [AntiLag] Log=1; problems and the F8 probe are always written.
+    static const char* const kBad[] = {"FAILED", "could not", "can not", "fault", "never", "no hooks", "probe:", "no (the car"};
+    bool bad = false;
+    for (const char* k : kBad) if (std::strstr(line, k)) bad = true;
+    if (g_verbose || bad) g_api->log(g_mod, line);
 }
 
 std::string cfg_str(const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
@@ -732,7 +737,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     info.size             = sizeof info;
     info.name             = "Anti-Lag";
     info.version          = ANTILAG_VERSION;
-    info.github_repo      = "Levilente/FH3_AntiLag";
+    info.github_repo      = "Levilente/FH3_AntiLag_NewPops";
     info.platform_version = FH3MOD_PLATFORM_VERSION;
     info.check_updates    = 1;
     info.description      = "Anti-lag for turbo cars: boost kept on lift-off, with exhaust pops. A tuning menu for decay, retention, cutoff and pop interval.";
