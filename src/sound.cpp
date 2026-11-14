@@ -4,6 +4,7 @@
 #include <xmmintrin.h>
 #include <mmsystem.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -162,13 +163,13 @@ bool sound_init(const char* type, float volume) {
 
 // ---- the game's own FMOD: the samples become FMOD sounds and play as 3D channels at the pipe's world position ------------------------------
 // The functions are the public (static linked) FMOD core API of the game's exe; the System handle is the one the game gives to set3DListenerAttributes.
+typedef bool (*SoundRelPosFn)(int tag, float out[3]);
 namespace {
 typedef int (*CreateSoundFn)(void*, const void*, unsigned, void*, void**);
 typedef int (*PlaySoundFn)(void*, void*, void*, bool, void**);
-typedef int (*Set3DFn)(void*, const float*, const float*, const void*);
 typedef int (*SetFloatFn)(void*, float);
 typedef int (*SetPausedFn)(void*, bool);
-constexpr uintptr_t kCreateSound = 0x27BE3F0, kPlaySound = 0x27BFA40, kSet3D = 0x27C28F0, kSetVolume = 0x27C3450, kSetPitch = 0x27C3160, kSetPaused = 0x27C3080;
+constexpr uintptr_t kCreateSound = 0x27BE3F0, kPlaySound = 0x27BFA40, kSetVolume = 0x27C3450, kSetPitch = 0x27C3160, kSetPaused = 0x27C3080;
 char* g_fgame = nullptr;
 std::atomic<void*> g_fsys{nullptr};
 std::atomic<bool> g_fmod_on{false};
@@ -181,28 +182,113 @@ void sound_fmod_system(void* sys) { if (sys) g_fsys.store(sys); }
 int sound_fmod_state() { return (g_fmod_on.load() ? 1 : 0) | (g_fsys.load() ? 2 : 0) | (g_fmod_err ? 4 : 0); }
 bool sound_fmod_ready() { return g_fmod_on.load() && g_fsys.load() && !g_fmod_err; }
 
-bool sound_play_fmod(int strength, const float pos[3], const float vel_in[3], void (*log)(const char*, int)) {
+// The game runs FMOD with more than one listener, and FMOD's plain 3D channels don't pan then (they come out in the middle of the head).
+// So our channels are 2D, and their speaker mix (direction) and volume (distance) are set by us from the listener the game sets, every update,
+// like the game's own spatialiser does for its events. They play in the game's own mixer, on its master bus.
+typedef int (*SetMixFn)(void*, float*, int, int, int);
+typedef int (*SwFmtFn)(void*, int*, int*, int*);
+typedef int (*StopFn)(void*);
+constexpr uintptr_t kSetMix = 0x27C2DB0, kSwFmt = 0x27BF4F0, kStop = 0x27C3620;
+namespace {
+struct FVoice { void* ch = nullptr; int tag = -1; uint64_t end = 0; float vol = 0; };
+FVoice g_fv[16];
+SRWLOCK g_fvlock = SRWLOCK_INIT;
+SoundRelPosFn g_relpos = nullptr;
+int g_spk_mode = -1, g_spk_n = 2;
+struct Spk { int idx; float ang; };
+std::vector<Spk> g_spk;
+void speakers_init(void* sys) {
+    int rate = 0, mode = 0, raw = 0;
+    if (reinterpret_cast<SwFmtFn>(g_fgame + kSwFmt)(sys, &rate, &mode, &raw) != 0) mode = 3;
+    g_spk_mode = mode;
+    g_spk.clear();
+    switch (mode) {                                          // FMOD_SPEAKERMODE: 2 mono, 3 stereo, 4 quad, 5 surround, 6 5.1, 7 7.1 (angles: degrees, + right)
+    case 2: g_spk_n = 1; g_spk = {{0, 0}}; break;
+    case 4: g_spk_n = 4; g_spk = {{0, -45}, {1, 45}, {2, -135}, {3, 135}}; break;
+    case 5: g_spk_n = 5; g_spk = {{0, -30}, {1, 30}, {2, 0}, {3, -110}, {4, 110}}; break;
+    case 6: g_spk_n = 6; g_spk = {{0, -30}, {1, 30}, {2, 0}, {4, -110}, {5, 110}}; break;
+    case 7: g_spk_n = 8; g_spk = {{0, -30}, {1, 30}, {2, 0}, {4, -90}, {5, 90}, {6, -150}, {7, 150}}; break;
+    default: g_spk_n = 2; g_spk = {{0, -90}, {1, 90}}; break;
+    }
+}
+// gains for a source at listener-relative (x right, y up, z ahead): constant power between the two speakers around its direction; very close sources spread out
+void mix_for(const float r[3], float* m, float* att) {
+    for (int i = 0; i < 8; ++i) m[i] = 0;
+    const float d = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    *att = d <= 3.0f ? 1.0f : 3.0f / (3.0f + (d - 3.0f) * 0.85f);      // full up to 3 m, then falls off like the game's car sounds
+    if (g_spk_n == 1) { m[0] = 1; return; }
+    const float spread = d < 1.0f ? 1.0f - d : 0.0f;                    // inside a metre the sound is around you
+    if (g_spk_n == 2) {
+        const float p = d > 0.01f ? r[0] / (d > 0.5f ? d : 0.5f) : 0.0f; // -1 left .. +1 right (the side, front and back alike: headphones/stereo)
+        const float pp = p * (1.0f - spread);
+        const float a = (pp + 1.0f) * 0.785398f;
+        m[0] = std::cos(a); m[1] = std::sin(a);
+        return;
+    }
+    float az = std::atan2(r[0], r[2]) * 57.29578f;                      // 0 ahead, +90 right, +-180 behind
+    const size_t n = g_spk.size();
+    std::vector<Spk> s = g_spk;
+    std::sort(s.begin(), s.end(), [](const Spk& x, const Spk& y) { return x.ang < y.ang; });
+    size_t lo = n - 1, hi = 0;
+    for (size_t i = 0; i < n; ++i) { if (s[i].ang <= az) lo = i; }
+    hi = (lo + 1) % n;
+    float a0 = s[lo].ang, a1 = s[hi].ang;
+    if (a1 <= a0) a1 += 360.0f;
+    float x = az; if (x < a0) x += 360.0f;
+    const float t = a1 > a0 ? (x - a0) / (a1 - a0) : 0.0f;
+    m[s[lo].idx] = std::cos(t * 1.570796f) * (1.0f - spread);
+    m[s[hi].idx] += std::sin(t * 1.570796f) * (1.0f - spread);
+    if (spread > 0) { const float e = spread / std::sqrt(static_cast<float>(n)); for (const Spk& k : g_spk) m[k.idx] += e; }
+}
+void apply(FVoice& v) {
+    float r[3];
+    if (!g_relpos || !g_relpos(v.tag, r)) return;
+    float m[8], att;
+    mix_for(r, m, &att);
+    reinterpret_cast<SetMixFn>(g_fgame + kSetMix)(v.ch, m, g_spk_n, 1, 1);
+    reinterpret_cast<SetFloatFn>(g_fgame + kSetVolume)(v.ch, v.vol * att);
+}
+}
+void sound_fmod_set_relpos(SoundRelPosFn f) { g_relpos = f; }
+
+// Every listener update: the voices still playing follow the pipe and the camera.
+void sound_fmod_update() {
+    if (!sound_fmod_ready()) return;
+    const uint64_t now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_fvlock);
+    __try {
+        for (FVoice& v : g_fv) {
+            if (!v.ch) continue;
+            if (now > v.end) { v.ch = nullptr; continue; }
+            apply(v);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ReleaseSRWLockExclusive(&g_fvlock);
+}
+
+bool sound_play_fmod(int strength, int tag, void (*log)(const char*, int)) {
     if (!sound_fmod_ready() || g_pick.empty()) return false;
     __try {
         void* sys = g_fsys.load();
+        if (g_spk_mode < 0) { speakers_init(sys); if (log) log("speaker mode", g_spk_mode); }
         AcquireSRWLockExclusive(&g_lock);
         const int idx = g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()];
         ReleaseSRWLockExclusive(&g_lock);
         if (g_fsound.size() < g_samples.size()) { g_fsound.resize(g_samples.size(), nullptr); g_fpcm.resize(g_samples.size()); }
+        const Sample& sm = g_samples[static_cast<size_t>(idx)];
         if (!g_fsound[static_cast<size_t>(idx)]) {
-            const Sample& sm = g_samples[static_cast<size_t>(idx)];
             std::vector<int16_t>& pcm = g_fpcm[static_cast<size_t>(idx)];
             pcm.assign(sm.data, sm.data + sm.frames);
-            const uint32_t fade = 960;                                  // 20 ms fade out: the cut at the end must not click
+            const uint32_t fade = 480;                                  // 10 ms fade out: the end must not click
             for (uint32_t i = 0; i < fade && i < sm.frames; ++i) pcm[sm.frames - 1 - i] = static_cast<int16_t>(pcm[sm.frames - 1 - i] * (static_cast<float>(i) / fade));
             alignas(8) unsigned char ex[0x20] = {};
-            *reinterpret_cast<int*>(ex + 0x00) = 0x18;                  // cbsize: only the fields up to 'format' (the game's FMOD takes shorter structs)
-            *reinterpret_cast<unsigned*>(ex + 0x04) = sm.frames * 2;    // length in bytes
-            *reinterpret_cast<int*>(ex + 0x0C) = 1;                     // numchannels
-            *reinterpret_cast<int*>(ex + 0x10) = 48000;                 // defaultfrequency
-            *reinterpret_cast<int*>(ex + 0x14) = 2;                     // FMOD_SOUND_FORMAT_PCM16
+            *reinterpret_cast<int*>(ex + 0x00) = 0x18;
+            *reinterpret_cast<unsigned*>(ex + 0x04) = sm.frames * 2;
+            *reinterpret_cast<int*>(ex + 0x0C) = 1;
+            *reinterpret_cast<int*>(ex + 0x10) = 48000;
+            *reinterpret_cast<int*>(ex + 0x14) = 2;                     // PCM16
             void* snd = nullptr;
-            const unsigned mode = 0x1 | 0x10 | 0x100 | 0x800 | 0x1000;  // LOOP_OFF | 3D | CREATESAMPLE | OPENMEMORY | OPENRAW
+            const unsigned mode = 0x1 | 0x8 | 0x100 | 0x800 | 0x1000;   // LOOP_OFF | 2D | CREATESAMPLE | OPENMEMORY | OPENRAW
             const int r = reinterpret_cast<CreateSoundFn>(g_fgame + kCreateSound)(sys, pcm.data(), mode, ex, &snd);
             if (log) log("createSound", r);
             if (r != 0 || !snd) { g_fmod_err = r ? r : -1; return false; }
@@ -212,13 +298,21 @@ bool sound_play_fmod(int strength, const float pos[3], const float vel_in[3], vo
         int r = reinterpret_cast<PlaySoundFn>(g_fgame + kPlaySound)(sys, g_fsound[static_cast<size_t>(idx)], nullptr, true, &ch);
         if (log) log("playSound", r);
         if (r != 0 || !ch) return false;
-        const float vel[3] = { vel_in[0], vel_in[1], vel_in[2] };   // the pipe moves with the car: without this FMOD's Doppler (the camera moves) bends every pop
-        r = reinterpret_cast<Set3DFn>(g_fgame + kSet3D)(ch, pos, vel, nullptr);
-        if (log) log("set3DAttributes", r);
         const float base = strength >= 3 ? 1.0f : (strength == 2 ? 0.72f : 0.45f);
-        reinterpret_cast<SetFloatFn>(g_fgame + kSetVolume)(ch, base * g_volume.load() * static_cast<float>(0.9 + 0.2 * rnd()));
-        reinterpret_cast<SetFloatFn>(g_fgame + kSetPitch)(ch, static_cast<float>((0.97 + 0.06 * rnd())));
-        reinterpret_cast<SetPausedFn>(g_fgame + kSetPaused)(ch, false);
+        const float pitch = static_cast<float>(0.97 + 0.06 * rnd());
+        reinterpret_cast<SetFloatFn>(g_fgame + kSetPitch)(ch, pitch);
+        AcquireSRWLockExclusive(&g_fvlock);
+        FVoice* slot = &g_fv[0];
+        for (FVoice& v : g_fv) { if (!v.ch) { slot = &v; break; } if (v.end < slot->end) slot = &v; }
+        if (slot->ch) reinterpret_cast<StopFn>(g_fgame + kStop)(slot->ch);   // all 16 busy: the oldest makes room
+        slot->ch = ch;
+        slot->tag = tag;
+        slot->vol = base * g_volume.load() * static_cast<float>(0.9 + 0.2 * rnd());
+        slot->end = GetTickCount64() + static_cast<uint64_t>(1000.0 * sm.frames / 48000.0 / pitch) + 60;
+        apply(*slot);
+        ReleaseSRWLockExclusive(&g_fvlock);
+        r = reinterpret_cast<SetPausedFn>(g_fgame + kSetPaused)(ch, false);
+        if (log) log("start (2D, mixed by us)", r);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_fmod_err = -2;

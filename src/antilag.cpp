@@ -37,7 +37,10 @@ void sound_fmod_attach(char* game, bool enable);
 void sound_fmod_system(void* sys);
 bool sound_fmod_ready();
 int sound_fmod_state();
-bool sound_play_fmod(int strength, const float pos[3], const float vel[3], void (*log)(const char*, int));
+typedef bool (*SoundRelPosFn)(int tag, float out[3]);
+bool sound_play_fmod(int strength, int tag, void (*log)(const char*, int));
+void sound_fmod_set_relpos(SoundRelPosFn f);
+void sound_fmod_update();
 void sound_shutdown();
 void sound_set_type(const char* type);
 void sound_set_reverb(float amount);
@@ -97,7 +100,6 @@ std::string cfg_str(const wchar_t* sec, const wchar_t* key, const wchar_t* def) 
     WideCharToMultiByte(CP_ACP, 0, buf, -1, o, sizeof o, nullptr, nullptr);
     return o;
 }
-bool g_native_fx = true;   // keep the game's own backfire effect (flames and its sound) next to ours
 
 int cfg_int(const wchar_t* sec, const wchar_t* key, int def) {
     wchar_t buf[64] = L"";
@@ -482,155 +484,109 @@ int detour_listener(void* sys, int idx, const float* pos, const float* vel, cons
             Pose p; for (int i = 0; i < 3; ++i) { p.pos[i] = pos[i]; p.fwd[i] = fwd[i]; p.up[i] = up[i]; }
             g_listener = p; g_listener_ok.store(true);
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        sound_fmod_update();   // our voices follow the pipe and the camera
     }
     return g_orig_listener(sys, idx, pos, vel, fwd, up);
 }
-// The pipes' matrices are local to the car; the car's own world transform is looked for in the car and dynamics memory: a 3x4/4x4 block whose translation is near the camera
-// and whose three rows before it are a rotation. Found once per car, checked on every use.
-struct WorldXf { const float* t = nullptr; bool rot = false; };
-char* g_xf_car = nullptr;
-WorldXf g_xf;
 static bool finite3(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
-static bool rot_rows(const float* t) {                      // rows at t-12, t-8, t-4 (stride 4 floats, translation row at t)
-    const float* r[3] = { t - 12, t - 8, t - 4 };
-    for (int i = 0; i < 3; ++i) { if (!finite3(r[i])) return false; const float l = r[i][0]*r[i][0] + r[i][1]*r[i][1] + r[i][2]*r[i][2]; if (std::fabs(l - 1.0f) > 0.03f) return false; }
-    for (int i = 0; i < 3; ++i) for (int j = i + 1; j < 3; ++j) if (std::fabs(r[i][0]*r[j][0] + r[i][1]*r[j][1] + r[i][2]*r[j][2]) > 0.03f) return false;
-    return true;
-}
-bool near_cam(const float* t) {
-    const Pose L = g_listener;
-    const float dx = t[0] - L.pos[0], dy = t[1] - L.pos[1], dz = t[2] - L.pos[2];
-    return finite3(t) && dx*dx + dy*dy + dz*dz < 30.0f * 30.0f;
-}
-// CCarDynamics keeps the world position at +0x30 and the rotation rows (right, up, forward) at +0x70, +0x80, +0x90 (found in NitroSystem II's FH3 port).
-void find_world(char* car) {
-    g_xf = WorldXf{};
-    g_xf_car = car;
-    char* dyn = g_al_dyn.load();
-    if (!dyn || !readable(dyn, 0xA0)) return;
-    const float* t = reinterpret_cast<const float*>(dyn + 0x30);
-    bool ok = finite3(t) && finite3(reinterpret_cast<const float*>(dyn + 0x70));
-    float d = 0;
-    if (ok) { const Pose L = g_listener; const float dx = t[0]-L.pos[0], dy = t[1]-L.pos[1], dz = t[2]-L.pos[2]; d = std::sqrt(dx*dx + dy*dy + dz*dz); }
-    say_always("anti-lag: car world position %.1f %.1f %.1f, %.1f m from the camera; rows %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f", t[0], t[1], t[2], d,
-               *reinterpret_cast<const float*>(dyn+0x70), *reinterpret_cast<const float*>(dyn+0x74), *reinterpret_cast<const float*>(dyn+0x78),
-               *reinterpret_cast<const float*>(dyn+0x80), *reinterpret_cast<const float*>(dyn+0x84), *reinterpret_cast<const float*>(dyn+0x88),
-               *reinterpret_cast<const float*>(dyn+0x90), *reinterpret_cast<const float*>(dyn+0x94), *reinterpret_cast<const float*>(dyn+0x98));
-    if (ok) { g_xf.t = t; g_xf.rot = true; }
-}
 int g_flip_pan = 0;
 // The world position of one of the car's pipes (car + 0x88: eight weak pointers to the exhaust nodes, each node's vtable +0x10 gives its 4x4 matrix).
-bool exhaust_world(char* car, float out[3]) {
-    int idx[8], n = 0;
-    for (int attempt = 0; attempt < 2 && !n; ++attempt) {
+// ---- the pipes: the game's own exhaust locators (car + 0x88: eight weak pointers, 0x10 apart; each node's vtable +0x10 gives its 4x4 matrix in the car's frame) --
+// The game builds its backfire message from exactly these (Car update at 0x18B8F42): 8 entries of 0x50 bytes, the matrix and a "fire" byte at +0x40.
+constexpr int kTipSize = 0x50, kTipBytes = 0x280;
+uint32_t gather_tips(char* car, uint8_t* msg, float locs[8][3]) {
+    std::memset(msg, 0, kTipBytes);
+    uint32_t mask = 0;
+    for (int attempt = 0; attempt < 2 && !mask; ++attempt) {
         for (int i = 0; i < 8; ++i) {
             char* el = car + 0x88 + i * 0x10;
             void* obj = *reinterpret_cast<void**>(el);
             char* ctrl = *reinterpret_cast<char**>(el + 8);
-            if (obj && ctrl && *reinterpret_cast<int*>(ctrl + 8) > 0) idx[n++] = i;
+            if (!obj || !ctrl || *reinterpret_cast<volatile int*>(ctrl + 8) <= 0) continue;
+            auto getm = reinterpret_cast<const float* (*)(void*)>((*reinterpret_cast<void***>(obj))[2]);
+            const float* m = getm(obj);
+            if (!m || !readable(m, 0x40)) continue;
+            std::memcpy(msg + i * kTipSize, m, 0x40);
+            msg[i * kTipSize + 0x40] = 1;
+            locs[i][0] = m[12]; locs[i][1] = m[13]; locs[i][2] = m[14];
+            mask |= 1u << i;
         }
-        if (!n && attempt == 0) {
-            // The game only resolves the exhaust locators (car vtable +0x270) while it has a backfire to post; with its own effects off nobody asks, so ask now.
+        if (!mask && attempt == 0) {
+            // the game resolves the locators (car vtable +0x270) only when it posts a backfire itself; we post instead of it, so we ask for them
             static uint64_t last = 0; const uint64_t t = GetTickCount64();
             if (t - last < 500) break;
             last = t;
-            auto resolve = reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(car))[0x270 / 8]);
-            resolve(car);
+            reinterpret_cast<void (*)(void*)>((*reinterpret_cast<void***>(car))[0x270 / 8])(car);
         }
     }
-    if (!n) { static int c = 0; if (c++ < 3) say_always("anti-lag: no live exhaust node on this car"); return false; }
-    const int pick = idx[static_cast<size_t>(rnd01() * n) % n];
-    char* el = car + 0x88 + pick * 0x10;
-    void* obj = *reinterpret_cast<void**>(el);
-    auto getm = reinterpret_cast<const float* (*)(void*)>((*reinterpret_cast<void***>(obj))[2]);
-    const float* m = getm(obj);
-    if (!m) return false;
-    if (!g_listener_ok.load()) return false;
-    const char* mode = "row";
-    float loc[3] = { m[12], m[13], m[14] };
-    if (g_xf_car != car || g_xf.t != reinterpret_cast<const float*>(g_al_dyn.load() + 0x30)) find_world(car);
-    if (!g_xf.t || !readable(g_xf.t, 0x60)) return false;
-    if (g_xf.rot) {
-        const float* R = reinterpret_cast<const float*>(reinterpret_cast<const char*>(g_xf.t) + 0x40);   // dyn+0x70, rows 0x10 apart
-        for (int k = 0; k < 3; ++k) out[k] = loc[0] * R[k] + loc[1] * R[4 + k] + loc[2] * R[8 + k] + g_xf.t[k];
-    } else { for (int k = 0; k < 3; ++k) out[k] = g_xf.t[k]; mode = "centre"; }
-    static int logged = 0;
-    if (logged < 6 && g_listener_ok.load()) {
-        ++logged;
-        say_always("anti-lag: pipe %d (%s) at %.2f %.2f %.2f, camera at %.2f %.2f %.2f, fwd %.2f %.2f %.2f, up %.2f %.2f %.2f; matrix row3 %.2f %.2f %.2f %.2f",
-                   pick, mode, out[0], out[1], out[2], g_listener.pos[0], g_listener.pos[1], g_listener.pos[2],
-                   g_listener.fwd[0], g_listener.fwd[1], g_listener.fwd[2], g_listener.up[0], g_listener.up[1], g_listener.up[2], m[12], m[13], m[14], m[15]);
-    }
+    return mask;
+}
+// The flames: the very message the game posts for its own backfire, to the car's deferred presentation (car + 0x73A0, vtable +0x2E8).
+bool g_flames = true;
+bool post_flames(char* car, const uint8_t* msg) {
+    if (!*reinterpret_cast<uint8_t*>(car + 0x7269)) return false;     // the game doesn't post for this car either
+    void* deferred = *reinterpret_cast<void**>(car + 0x73A0);
+    if (!deferred || !readable(deferred, 8)) return false;
+    alignas(16) uint8_t buf[0x290] = {};
+    std::memcpy(buf, msg, kTipBytes);
+    reinterpret_cast<void (*)(void*, void*)>((*reinterpret_cast<void***>(deferred))[0x2E8 / 8])(deferred, buf);
     return true;
 }
+
+// Sources of the sounds playing: a pipe (in the car's frame) and the car's dynamics; followed every listener update.
+struct Src { char* dyn = nullptr; float loc[3] = {0, 0, 0}; };
+Src g_src[16];
+int g_src_next = 0;
+bool car_world(char* dyn, const float loc[3], float out[3]) {
+    if (!dyn || !readable(dyn, 0xA0)) return false;
+    const float* T = reinterpret_cast<const float*>(dyn + 0x30);      // CCarDynamics: position +0x30, rows right/up/forward at +0x70/+0x80/+0x90
+    const float* R = reinterpret_cast<const float*>(dyn + 0x70);
+    if (!finite3(T) || !finite3(R)) return false;
+    for (int k = 0; k < 3; ++k) out[k] = loc[0] * R[k] + loc[1] * R[4 + k] + loc[2] * R[8 + k] + T[k];
+    return true;
+}
+bool to_listener(const float w[3], float out[3]) {
+    if (!g_listener_ok.load()) return false;
+    const Pose L = g_listener;
+    const float d[3] = { w[0] - L.pos[0], w[1] - L.pos[1], w[2] - L.pos[2] };
+    float r[3] = { L.up[1] * L.fwd[2] - L.up[2] * L.fwd[1], L.up[2] * L.fwd[0] - L.up[0] * L.fwd[2], L.up[0] * L.fwd[1] - L.up[1] * L.fwd[0] };   // FMOD frame: right = up x forward
+    if (g_flip_pan % 100) for (float& x : r) x = -x;
+    out[0] = d[0] * r[0] + d[1] * r[1] + d[2] * r[2];
+    out[1] = d[0] * L.up[0] + d[1] * L.up[1] + d[2] * L.up[2];
+    out[2] = d[0] * L.fwd[0] + d[1] * L.fwd[1] + d[2] * L.fwd[2];
+    return true;
+}
+bool src_relpos(int tag, float out[3]) {
+    if (tag < 0 || tag >= 16) return false;
+    float w[3];
+    __try { if (!car_world(g_src[tag].dyn, g_src[tag].loc, w)) return false; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return to_listener(w, out);
+}
+
 void fmod_log(const char* what, int r) {
     static int n = 0;
     if (n < 12 || r != 0) { ++n; if (n < 40) say_always("anti-lag: FMOD %s -> %d", what, r); }
 }
 void play_pop(char* car, int strength) {
-    float p[3];
-    {
-        static int why = 0;
-        const bool rdy = sound_fmod_ready(), lok = g_listener_ok.load();
-        const bool ew = rdy && exhaust_world(car, p);
-        if (ew) {
-            float v[3] = {0, 0, 0};
-            char* dyn = g_al_dyn.load();
-            if (dyn && readable(dyn, 0x20)) { const float* dv = reinterpret_cast<const float*>(dyn + 0x10); if (finite3(dv)) { v[0] = dv[0]; v[1] = dv[1]; v[2] = dv[2]; } }   // CCarDynamics +0x10: velocity
-            if (sound_play_fmod(strength, p, v, fmod_log)) return;
-        }
-        if (why < 8) { ++why; say_always("anti-lag: native pop not used: fmod state %d (1 on, 2 system, 4 error), listener %d, pipe/world %d, dyn %p", sound_fmod_state(), lok ? 1 : 0, ew ? 1 : 0, static_cast<void*>(g_al_dyn.load())); }
+    alignas(16) uint8_t msg[kTipBytes];
+    float locs[8][3] = {};
+    const uint32_t mask = gather_tips(car, msg, locs);
+    if (g_flames && mask) {
+        const bool ok = post_flames(car, msg);
+        static int logged = 0;
+        if (logged < 3) { ++logged; say_always("anti-lag: flames posted on the pipes %02X: %s", mask, ok ? "yes" : "no (the car has no backfire presentation)"); }
     }
-    if (g_listener_ok.load() && exhaust_world(car, p)) {
-        const Pose L = g_listener;
-        const float d[3] = { p[0] - L.pos[0], p[1] - L.pos[1], p[2] - L.pos[2] };
-        // FMOD's default frame is left handed: right = up x forward
-        float r[3] = { L.up[1] * L.fwd[2] - L.up[2] * L.fwd[1], L.up[2] * L.fwd[0] - L.up[0] * L.fwd[2], L.up[0] * L.fwd[1] - L.up[1] * L.fwd[0] };
-        if (g_flip_pan % 100) for (float& x : r) x = -x;
-        const float lx = d[0] * r[0] + d[1] * r[1] + d[2] * r[2];
-        const float ly = d[0] * L.up[0] + d[1] * L.up[1] + d[2] * L.up[2];
-        const float lz = d[0] * L.fwd[0] + d[1] * L.fwd[1] + d[2] * L.fwd[2];
-        const float dist = std::sqrt(lx * lx + ly * ly + lz * lz);
-        if (dist < 80.0f) { sound_play(strength, true, lx, ly, lz); return; }
-    }
-    sound_play(strength, false, 0, 0, 0);
-}
-
-// ---- the game's own backfire sound is muted (its flame stays): FMOD Studio events started inside the presentation's backfire routine are dropped ----------------
-constexpr uintptr_t kRvaBackfireRoutine = 0x1E741B0;   // CarPresentation backfire (pres, tips, r8, r9): spawns the flames
-constexpr uintptr_t kRvaEventStart      = 0x28A6630;   // FMOD Studio EventInstance::start (handle)
-thread_local int t_in_backfire = 0;
-std::atomic<uint64_t> g_ev_tick{0};
-std::atomic<int> g_mute_native{1};
-typedef uint64_t (*BfRoutineFn)(void*, const void*, void*, void*);
-BfRoutineFn g_orig_bf_routine = nullptr;
-uint64_t detour_bf_routine(void* pres, const void* tips, void* r8, void* r9) {
-    ++t_in_backfire;
-    const uint64_t r = g_orig_bf_routine(pres, tips, r8, r9);
-    --t_in_backfire;
-    return r;
-}
-typedef int (*EvStartFn)(void*);
-EvStartFn g_orig_ev_start = nullptr;
-int detour_ev_start(void* h) {
-    static int logged = 0;
-    const bool near_pop = GetTickCount64() - g_ev_tick.load() < 250;
-    if (t_in_backfire && g_mute_native.load()) {
-        if (logged < 6) { ++logged; say_always("anti-lag: muted a game sound inside the backfire routine (from %p)", __builtin_return_address(0)); }
-        return 0;
-    }
-    if (near_pop && logged < 40) {
-        ++logged;
-        char path[256] = "?";
-        __try {
-            void* desc = nullptr; int n = 0;
-            const int r = reinterpret_cast<int (*)(void*, void**)>(g_game + 0x28A9A60)(h, &desc);        // EventInstance::getDescription
-            if (r == 0 && desc) reinterpret_cast<int (*)(void*, char*, int, int*)>(g_game + 0x28AA690)(desc, path, sizeof path, &n);   // EventDescription::getPath
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        say_always("anti-lag: event %s started %llu ms after a pop (inside the backfire routine: %d)", path,
-                   static_cast<unsigned long long>(GetTickCount64() - g_ev_tick.load()), t_in_backfire);
-    }
-    return g_orig_ev_start(h);
+    if (!mask) { static int c = 0; if (c++ < 3) say_always("anti-lag: no exhaust locator on this car"); sound_play(strength, false, 0, 0, 0); return; }
+    int pipes[8], n = 0;
+    for (int i = 0; i < 8; ++i) if (mask & (1u << i)) pipes[n++] = i;
+    const int pick = pipes[static_cast<size_t>(rnd01() * n) % n];
+    const int tag = g_src_next++ & 15;
+    g_src[tag].dyn = g_al_dyn.load();
+    for (int k = 0; k < 3; ++k) g_src[tag].loc[k] = locs[pick][k];
+    if (sound_fmod_ready() && sound_play_fmod(strength, tag, fmod_log)) return;
+    float r[3];
+    if (src_relpos(tag, r)) sound_play(strength, true, r[0], r[1], r[2]);
+    else sound_play(strength, false, 0, 0, 0);
 }
 
 void detour_burble(void* self, float dt, void** iface) {
@@ -657,9 +613,8 @@ void detour_burble(void* self, float dt, void** iface) {
             }
         }
         if (*ev != 0) {                                  // a pop this frame (the game's own or ours): our sound, and the game's effect if wanted
-            g_ev_tick.store(GetTickCount64());
-            play_pop(car, *ev);
-            if (!g_native_fx) *ev = 0;
+            play_pop(car, *ev);     // ours: the sound in the game's mixer at the pipe, the game's flames on the pipes
+            *ev = 0;                // and the game's own backfire (its sound) doesn't happen
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -728,11 +683,6 @@ DWORD WINAPI install_hooks(LPVOID) {
     FH3Hook* h5 = g_api->hook_function(g_mod, "FMOD listener (Anti-Lag: 3D sound)", g_game + kRvaListener, reinterpret_cast<void*>(&detour_listener),
                                        reinterpret_cast<void**>(&g_orig_listener));
     say("hook: listener %s", h5 && g_api->enable_hooks(g_mod, h5) ? "on" : "FAILED");
-    FH3Hook* h6 = g_api->hook_function(g_mod, "CarPresentation backfire (Anti-Lag: mute its sound)", g_game + kRvaBackfireRoutine, reinterpret_cast<void*>(&detour_bf_routine),
-                                       reinterpret_cast<void**>(&g_orig_bf_routine));
-    FH3Hook* h7 = g_api->hook_function(g_mod, "FMOD Studio EventInstance::start (Anti-Lag)", g_game + kRvaEventStart, reinterpret_cast<void*>(&detour_ev_start),
-                                       reinterpret_cast<void**>(&g_orig_ev_start));
-    say("hook: backfire routine %s, event start %s", h6 && g_api->enable_hooks(g_mod, h6) ? "on" : "FAILED", h7 && g_api->enable_hooks(g_mod, h7) ? "on" : "FAILED");
     FH3Hook* h8 = g_api->hook_function(g_mod, "Tuning scene constructor (research)", g_game + 0x16DF700, reinterpret_cast<void*>(&detour_tune_scene), reinterpret_cast<void**>(&g_orig_tune_scene));
     FH3Hook* h9 = g_api->hook_function(g_mod, "SetValue (research)", g_game + 0x2145760, reinterpret_cast<void*>(&detour_setvalue), reinterpret_cast<void**>(&g_orig_setvalue));
     say("hook: tuning scene %s, SetValue %s", h8 && g_api->enable_hooks(g_mod, h8) ? "on" : "FAILED", h9 && g_api->enable_hooks(g_mod, h9) ? "on" : "FAILED");
@@ -818,7 +768,8 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_cfg_path = std::wstring(api->azimuth_dir) + L"\\fh3-mods\\AntiLag.ini";
     g_extra_price = cfg_int(L"AntiLag", L"ExtraPrice", g_extra_price);
     g_verbose  = cfg_int(L"AntiLag", L"Log", 0) != 0;
-    g_native_fx = cfg_int(L"AntiLag", L"NativeEffects", 1) != 0;
+    g_flames = cfg_int(L"AntiLag", L"Flames", 1) != 0;
+    sound_fmod_set_relpos(&src_relpos);
     {
         const std::string type = cfg_str(L"AntiLag", L"Sound", L"Auto");
         const int vol = cfg_int(L"AntiLag", L"SoundVolume", 55);
