@@ -36,6 +36,7 @@ void sound_play(int strength, bool pos_ok, float lx, float ly, float lz);
 void sound_fmod_attach(char* game, bool enable);
 void sound_fmod_system(void* sys);
 bool sound_fmod_ready();
+int sound_fmod_state();
 bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int));
 void sound_shutdown();
 void sound_set_type(const char* type);
@@ -527,7 +528,7 @@ bool exhaust_world(char* car, float out[3]) {
         char* ctrl = *reinterpret_cast<char**>(el + 8);
         if (obj && ctrl && *reinterpret_cast<int*>(ctrl + 8) > 0) idx[n++] = i;
     }
-    if (!n) return false;
+    if (!n) { static int c = 0; if (c++ < 3) say_always("anti-lag: no live exhaust node on this car"); return false; }
     const int pick = idx[static_cast<size_t>(rnd01() * n) % n];
     char* el = car + 0x88 + pick * 0x10;
     void* obj = *reinterpret_cast<void**>(el);
@@ -558,7 +559,13 @@ void fmod_log(const char* what, int r) {
 }
 void play_pop(char* car, int strength) {
     float p[3];
-    if (sound_fmod_ready() && exhaust_world(car, p) && sound_play_fmod(strength, p, fmod_log)) return;
+    {
+        static int why = 0;
+        const bool rdy = sound_fmod_ready(), lok = g_listener_ok.load();
+        const bool ew = rdy && exhaust_world(car, p);
+        if (ew && sound_play_fmod(strength, p, fmod_log)) return;
+        if (why < 8) { ++why; say_always("anti-lag: native pop not used: fmod state %d (1 on, 2 system, 4 error), listener %d, pipe/world %d, dyn %p", sound_fmod_state(), lok ? 1 : 0, ew ? 1 : 0, static_cast<void*>(g_al_dyn.load())); }
+    }
     if (g_listener_ok.load() && exhaust_world(car, p)) {
         const Pose L = g_listener;
         const float d[3] = { p[0] - L.pos[0], p[1] - L.pos[1], p[2] - L.pos[2] };

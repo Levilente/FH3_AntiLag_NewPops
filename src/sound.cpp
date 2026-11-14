@@ -178,6 +178,7 @@ int g_fmod_err = 0;
 }
 void sound_fmod_attach(char* game, bool enable) { g_fgame = game; g_fmod_on.store(enable && game); }
 void sound_fmod_system(void* sys) { if (sys) g_fsys.store(sys); }
+int sound_fmod_state() { return (g_fmod_on.load() ? 1 : 0) | (g_fsys.load() ? 2 : 0) | (g_fmod_err ? 4 : 0); }
 bool sound_fmod_ready() { return g_fmod_on.load() && g_fsys.load() && !g_fmod_err; }
 
 bool sound_play_fmod(int strength, const float pos[3], void (*log)(const char*, int)) {
