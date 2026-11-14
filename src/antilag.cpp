@@ -773,6 +773,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
         row.set      = row_set;
         row.visible  = row_visible;
         row.user     = reinterpret_cast<void*>(static_cast<intptr_t>(s));
+        row.page     = "Engine";   // API 17: the ENGINE tab (older platforms: Springs)
         say("tuning row %s: %s", kDefs[s].key, api->add_tuning_row(g_mod, &row) ? "added" : "NOT added");
     }
 
