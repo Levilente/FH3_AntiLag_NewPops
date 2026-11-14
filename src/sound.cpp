@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdio>
 #include <unordered_map>
+#include <unordered_set>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -401,6 +402,32 @@ void classify_parent(void* parent) {
         }
     g_parents[parent] = 0;
 }
+// The bank a sample belongs to: a pointer in the sample's object that is itself a sound whose samples include this one (the subsound parent).
+std::unordered_set<void*> g_seen;
+bool readable_q(const void* p) { MEMORY_BASIC_INFORMATION mb; return p && VirtualQuery(p, &mb, sizeof mb) && mb.State == MEM_COMMIT && !(mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)); }
+void find_parent(void* snd) {
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(g_fgame), hi = lo + 0x6000000;
+    static int dumps = 0;
+    for (int off = 8; off < 0x400; off += 8) {
+        void* q = nullptr;
+        __try {
+            if (!readable_q(static_cast<char*>(snd) + off)) break;
+            q = *reinterpret_cast<void**>(static_cast<char*>(snd) + off);
+            if (!q || q == snd || reinterpret_cast<uintptr_t>(q) < 0x10000 || (reinterpret_cast<uintptr_t>(q) & 7) || !readable_q(q)) continue;
+            const uintptr_t vt = *reinterpret_cast<uintptr_t*>(q);
+            if (vt < lo || vt > hi) continue;
+            if (g_parents.find(q) == g_parents.end()) {
+                void* t = nullptr;
+                if (g_orig_getsub(q, 0, &t) != 0 || !t) continue;     // not a sound with samples
+                classify_parent(q);
+                if (dumps < 4 && g_slog) { ++dumps; char m[160]; std::snprintf(m, sizeof m, "anti-lag: a sample's bank found at +0x%X (%s)", off, g_parents[q] ? "a car bank with backfires" : "not a known car bank"); g_slog(m); }
+            }
+            if (g_parents[q]) return;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    static int miss = 0;
+    if (miss < 3 && g_slog) { ++miss; unsigned l = 0; __try { l = sub_len(snd); } __except (EXCEPTION_EXECUTE_HANDLER) {} char m[128]; std::snprintf(m, sizeof m, "anti-lag: a played sample (%u long) has no bank we know", l); g_slog(m); }
+}
 int detour_getsub(void* parent, int index, void** sub) {
     const int r = g_orig_getsub(parent, index, sub);
     if (r == 0 && parent) {
@@ -415,9 +442,12 @@ int detour_getsub(void* parent, int index, void** sub) {
 int detour_studio_play(void* snd, void* sys, void* grp, bool paused, int a5, void** ch) {
     void* use = snd;
     __try {
-        AcquireSRWLockShared(&g_stlock);
+        AcquireSRWLockExclusive(&g_stlock);
+        if (g_seen.insert(snd).second) find_parent(snd);       // a sample not seen yet: which bank is it from
         const bool bf = g_bf.find(snd) != g_bf.end();
-        ReleaseSRWLockShared(&g_stlock);
+        ReleaseSRWLockExclusive(&g_stlock);
+        static int calls = 0;
+        if (++calls == 1 && g_slog) g_slog("anti-lag: the game's sound-instrument player runs through us");
         if (bf && g_replace.load() && !g_pick.empty()) {
             AcquireSRWLockExclusive(&g_lock);
             const int idx = g_pick[static_cast<size_t>(rnd() * static_cast<double>(g_pick.size())) % g_pick.size()];
