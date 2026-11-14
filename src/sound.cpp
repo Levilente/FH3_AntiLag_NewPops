@@ -372,19 +372,36 @@ unsigned sub_len(void* sub) { unsigned l = 0; return reinterpret_cast<GetLenFn>(
 // the sample's parent (+0x310, its subsound parent) holds an array of its samples; the sample's place in it is its index in the bank.
 std::unordered_set<void*> g_seen;
 int g_arr_off = -1;                                     // where the parent keeps the array (found once)
-template <class T> bool rd(const void* p, T* out) { __try { *out = *static_cast<const T*>(p); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+// Only memory that is committed, readable and not a guard page (a stack's guard page touched by a stray read stops that thread's stack from growing).
+size_t readable_span(const void* p) {
+    MEMORY_BASIC_INFORMATION mb;
+    if (!p || !VirtualQuery(p, &mb, sizeof mb) || mb.State != MEM_COMMIT) return 0;
+    const DWORD pr = mb.Protect & 0xFF;
+    if ((mb.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) return 0;
+    return static_cast<size_t>(static_cast<const char*>(mb.BaseAddress) + mb.RegionSize - static_cast<const char*>(p));
+}
+template <class T> bool rd(const void* p, T* out) {
+    if (readable_span(p) < sizeof(T)) return false;
+    *out = *static_cast<const T*>(p);
+    return true;
+}
 int index_in(void** arr, void* snd, int maxn) {
-    __try { for (int k = 0; k < maxn; ++k) if (arr[k] == snd) return k; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const size_t span = readable_span(arr) / sizeof(void*);
+    const int n = static_cast<int>(span < static_cast<size_t>(maxn) ? span : static_cast<size_t>(maxn));
+    for (int k = 0; k < n; ++k) if (arr[k] == snd) return k;
     return -1;
 }
 void find_parent(void* snd) {
+    const unsigned len = sub_len(snd);
+    if (len == 0 || len > 72000) return;                 // backfires are short: nothing else is looked at
     void* parent = nullptr; uintptr_t vt = 0;
     if (!rd(static_cast<char*>(snd) + 0x310, &parent) || !parent || !rd(snd, &vt)) return;
     if (g_parents.count(parent)) { return; }
+    g_parents[parent] = 0;                               // decided once per bank, found or not
     void** arr = nullptr; int k = -1;
     if (g_arr_off >= 0) { if (rd(static_cast<char*>(parent) + g_arr_off, &arr) && arr) k = index_in(arr, snd, 4096); }
     else {
-        for (int o = 8; o < 0x800 && k < 0; o += 8) {
+        for (int o = 8; o < 0x400 && k < 0; o += 8) {
             void** a = nullptr;
             if (!rd(static_cast<char*>(parent) + o, &a) || !a || (reinterpret_cast<uintptr_t>(a) & 7) || reinterpret_cast<uintptr_t>(a) < 0x10000) continue;
             const int kk = index_in(a, snd, 4096);
