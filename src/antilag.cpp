@@ -484,6 +484,44 @@ int detour_listener(void* sys, int idx, const float* pos, const float* vel, cons
     }
     return g_orig_listener(sys, idx, pos, vel, fwd, up);
 }
+// The pipes' matrices are local to the car; the car's own world transform is looked for in the car and dynamics memory: a 3x4/4x4 block whose translation is near the camera
+// and whose three rows before it are a rotation. Found once per car, checked on every use.
+struct WorldXf { const float* t = nullptr; bool rot = false; };
+char* g_xf_car = nullptr;
+WorldXf g_xf;
+static bool finite3(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
+static bool rot_rows(const float* t) {                      // rows at t-12, t-8, t-4 (stride 4 floats, translation row at t)
+    const float* r[3] = { t - 12, t - 8, t - 4 };
+    for (int i = 0; i < 3; ++i) { if (!finite3(r[i])) return false; const float l = r[i][0]*r[i][0] + r[i][1]*r[i][1] + r[i][2]*r[i][2]; if (std::fabs(l - 1.0f) > 0.03f) return false; }
+    for (int i = 0; i < 3; ++i) for (int j = i + 1; j < 3; ++j) if (std::fabs(r[i][0]*r[j][0] + r[i][1]*r[j][1] + r[i][2]*r[j][2]) > 0.03f) return false;
+    return true;
+}
+bool near_cam(const float* t) {
+    const Pose L = g_listener;
+    const float dx = t[0] - L.pos[0], dy = t[1] - L.pos[1], dz = t[2] - L.pos[2];
+    return finite3(t) && dx*dx + dy*dy + dz*dz < 30.0f * 30.0f;
+}
+void find_world(char* car) {
+    g_xf = WorldXf{};
+    g_xf_car = car;
+    char* dyn = g_al_dyn.load();
+    struct Reg { char* base; size_t size; const char* name; } regs[2] = { { car, 0x8000, "car" }, { dyn, 0x3000, "dyn" } };
+    int hits = 0;
+    for (const Reg& rg : regs) {
+        if (!rg.base) continue;
+        for (size_t o = 48; o + 16 <= rg.size; o += 4) {
+            const float* t = reinterpret_cast<const float*>(rg.base + o);
+            if (!readable(t - 12, 64)) continue;
+            if (!near_cam(t)) continue;
+            if (std::fabs(t[0]) < 1.0f && std::fabs(t[2]) < 1.0f) continue;
+            const bool rot = rot_rows(t);
+            if (hits < 12) { say_always("anti-lag: world candidate %s+0x%zX (%.1f %.1f %.1f)%s", rg.name, o, t[0], t[1], t[2], rot ? " with a rotation before it" : ""); ++hits; }
+            if (rot) { g_xf.t = t; g_xf.rot = true; return; }
+            if (!g_xf.t) g_xf.t = t;
+        }
+    }
+    say_always("anti-lag: world transform %s", g_xf.t ? (g_xf.rot ? "found" : "only a position found") : "NOT found");
+}
 int g_flip_pan = 0;
 // The world position of one of the car's pipes (car + 0x88: eight weak pointers to the exhaust nodes, each node's vtable +0x10 gives its 4x4 matrix).
 bool exhaust_world(char* car, float out[3]) {
@@ -501,9 +539,15 @@ bool exhaust_world(char* car, float out[3]) {
     auto getm = reinterpret_cast<const float* (*)(void*)>((*reinterpret_cast<void***>(obj))[2]);
     const float* m = getm(obj);
     if (!m) return false;
-    const char* mode = g_flip_pan >= 100 ? "col" : "row";
-    if (g_flip_pan >= 100) { out[0] = m[3]; out[1] = m[7]; out[2] = m[11]; }
-    else                   { out[0] = m[12]; out[1] = m[13]; out[2] = m[14]; }
+    if (!g_listener_ok.load()) return false;
+    const char* mode = "row";
+    float loc[3] = { m[12], m[13], m[14] };
+    if (g_xf_car != car || (g_xf.t && !near_cam(g_xf.t))) find_world(car);
+    if (!g_xf.t || !readable(g_xf.t - 12, 64)) return false;
+    if (g_xf.rot) {
+        const float* R = g_xf.t - 12;
+        for (int k = 0; k < 3; ++k) out[k] = loc[0] * R[k] + loc[1] * R[4 + k] + loc[2] * R[8 + k] + g_xf.t[k];
+    } else { for (int k = 0; k < 3; ++k) out[k] = g_xf.t[k]; mode = "centre"; }
     static int logged = 0;
     if (logged < 6 && g_listener_ok.load()) {
         ++logged;
